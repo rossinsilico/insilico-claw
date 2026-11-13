@@ -43,3 +43,19 @@ test('a chosen UI font keeps its size on either glasses', () => {
   store.set(screen.GLASSES_TYPE_KEY, 'g2');
   assert.equal(fonts.getUiFontSelection().size, 17);
 });
+
+test('UI font listeners run after cache invalidation and revisions advance once per change', () => {
+  const { fonts } = fixture();
+  assert.equal(fonts.getDefaultSmallFont().size, 16);
+  const seen = [];
+  const off = fonts.onUiFontChanged((revision) => {
+    seen.push([revision, fonts.getDefaultSmallFont().lineHeight]);
+  });
+  fonts.setUiFontSelection({ kind: 'ttf', file: 'Roboto-Light.ttf', size: 17 });
+  assert.deepEqual(seen, [[1, 21]]);
+  assert.equal(fonts.getUiFontRevision(), 1);
+  off();
+  fonts.setUiFontSelection({ kind: 'ttf', file: 'Roboto-Light.ttf', size: 16 });
+  assert.deepEqual(seen, [[1, 21]]);
+  assert.equal(fonts.getUiFontRevision(), 2);
+});

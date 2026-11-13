@@ -1,0 +1,20 @@
+<Page xmlns="http://schemas.nativescript.org/tns.xsd" navigatingTo="navigatingTo" class="notification-settings-page">
+    <ActionBar title="{{ appName }}" />
+    <ScrollView>
+        <StackLayout class="notification-detail-content">
+            <Label class="notification-detail-identity" text="{{ packageName }}" textWrap="true" />
+            <Label class="notification-global-note" text="{{ globalPopupNote }}" textWrap="true" visibility="{{ globalPopupNoteVisibility }}" />
+            <GridLayout columns="*,auto" rows="auto,auto" class="notification-toggle-row">
+                <Label row="0" col="0" class="notification-toggle-title" text="Popups" />
+                <Label row="1" col="0" class="notification-toggle-description" text="Show new notifications over the current glasses screen." textWrap="true" />
+                <Switch rowSpan="2" col="1" checked="{{ popupsEnabled }}" checkedChange="{{ onPopupsChanged }}" accessible="true" accessibilityLabel="{{ popupAccessibilityLabel }}" />
+            </GridLayout>
+            <GridLayout columns="*,auto" rows="auto,auto" class="notification-toggle-row">
+                <Label row="0" col="0" class="notification-toggle-title" text="Status-bar icon" />
+                <Label row="1" col="0" class="notification-toggle-description" text="Keep an icon in the glasses status bar while notifications are available." textWrap="true" />
+                <Switch rowSpan="2" col="1" checked="{{ statusIconEnabled }}" checkedChange="{{ onStatusIconChanged }}" accessible="true" accessibilityLabel="{{ iconAccessibilityLabel }}" />
+            </GridLayout>
+            <Label class="notification-detail-footnote" text="Notifications app inventory remains available even when both options are off." textWrap="true" />
+        </StackLayout>
+    </ScrollView>
+</Page>

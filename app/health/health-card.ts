@@ -34,7 +34,7 @@ export function drawHealthCard(image: GrayImage, data: HealthCardData, small: Ui
   const { summary } = data;
   const cells: [string, string][] = [
     ["HR avg", average(summary.heartRate, " bpm")],
-    ["HRV avg", average(summary.hrv, " ms")],
+    ["R1 RMSSD avg", average(summary.hrv, " raw")],
     ["SpO2 avg", average(summary.spo2, "%")],
     ["Steps", data.hasSteps ? String(summary.steps) : "--"],
     ["Cal (kcal)", data.hasCalories ? String(summary.calories) : "--"],

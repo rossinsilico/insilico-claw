@@ -1,5 +1,6 @@
 import { KeyboardInputViewModel } from './keyboard-input-view-model'
-import { Application, Builder, Button, Color, Dialogs, Frame, GridLayout, Image, Label, Page, TextView, type PropertyChangeData, type TouchGestureEventData, type View } from '@nativescript/core'
+import { Application, Builder, Button, Color, Dialogs, Frame, GridLayout, Image, Label, Page, TabView, TabViewItem, TextView, type PropertyChangeData, type TouchGestureEventData, type View } from '@nativescript/core'
+import { createCompanionPanels } from './companion-panels.ios'
 import { isPreviewOnlyMode } from './onboarding-state'
 import { isAutoReconnectSuppressed, resumeAutoReconnect, suppressAutoReconnect } from '../g2/reconnect-policy'
 import { RemoteControlsViewModel } from './remote-controls-view-model'
@@ -13,19 +14,59 @@ import { deviceAddressError } from '../g2/ios-peripheral-identity'
 import { formatBatteryLine } from '../g2/glasses-display-state'
 import { shell } from '../ui/shell/shell'
 
+export interface CompanionGeometry {
+  innerWidth: number
+  innerHeight: number
+  mirrorWidth: number
+  mirrorHeight: number
+  showPreview: boolean
+}
+
+export function companionGeometry(width: number, height: number, landscape: boolean): CompanionGeometry {
+  const innerWidth = Math.max(0, width - (landscape ? 24 : 32))
+  const innerHeight = Math.max(0, height - (landscape ? 8 : 10))
+  const sectionGap = 12
+  const previewHeading = 19
+  const remoteHeight = 263
+  const remoteWidth = 345
+  const widthBudget = landscape ? Math.max(0, innerWidth - remoteWidth - sectionGap) : innerWidth
+  const heightBudget = landscape
+    ? Math.max(0, innerHeight - previewHeading)
+    : Math.max(0, innerHeight - remoteHeight - previewHeading - sectionGap)
+  const mirrorHeight = Math.min(widthBudget * 3 / 4, heightBudget)
+  const showPreview = mirrorHeight >= 72
+  return {
+    innerWidth,
+    innerHeight,
+    mirrorWidth: showPreview ? mirrorHeight * 4 / 3 : 0,
+    mirrorHeight: showPreview ? mirrorHeight : 0,
+    showPreview,
+  }
+}
+
 export function createMainPage(): Page {
   const page = new Page()
   page.actionBarHidden = true
   page.className = 'main-page'
   page.iosOverflowSafeAreaEnabled = false
   const root = new GridLayout()
-  root.rows = 'auto,*'
+  root.rows = '*'
   page.content = root
+  const glassesView = new GridLayout()
+  glassesView.rows = 'auto,auto,*'
+  glassesView.className = 'glasses-destination'
   const header = new GridLayout()
   header.columns = '*,auto,auto,auto,auto'; header.className = 'main-header'
   const title = new Label()
-  title.text = 'Faceclaw'; title.className = 'action-bar-title'
+  title.text = 'Glasses'; title.className = 'action-bar-title'
   header.addChild(title)
+  const compactState = new Label()
+  compactState.text = 'Preview · Battery levels unavailable'
+  compactState.className = 'compact-device-state'; compactState.visibility = 'collapse'
+  compactState.verticalAlignment = 'middle'; compactState.textWrap = true
+  compactState.accessibilityIdentifier = 'compact-device-state'
+  compactState.on('tap', () => { void openDevices() })
+  GridLayout.setColumn(compactState, 1); header.addChild(compactState)
   // The foreground EvenHub app's icon, which opens its phone UI. UIImageView
   // ignores padding, so a wrapper supplies Android's wider tap target.
   const appIconButton = new GridLayout()
@@ -36,12 +77,7 @@ export function createMainPage(): Page {
   appIconButton.addChild(appIcon)
   let phoneUiWindowId: string | null = null
   appIconButton.on('tap', () => { if (phoneUiWindowId) controller.showEvenHubPhoneUi(phoneUiWindowId) })
-  GridLayout.setColumn(appIconButton, 1); header.addChild(appIconButton)
-  const state = new Label()
-  state.text = 'Preview'; state.className = 'action-bar-status'
-  state.verticalAlignment = 'middle'
-  state.on('tap', () => { void openDevices() })
-  GridLayout.setColumn(state, 2); header.addChild(state)
+  GridLayout.setColumn(appIconButton, 2); header.addChild(appIconButton)
   // Android's warning triangle: shown while the glasses report firmware Faceclaw can't run.
   const warning = new Label()
   warning.text = '\u26A0\uFE0F'; warning.className = 'action-bar-warning'
@@ -52,46 +88,86 @@ export function createMainPage(): Page {
   const overflow = new Button()
   overflow.text = '⋮'; overflow.accessibilityLabel = 'More options'; overflow.className = 'overflow-button'
   overflow.on('tap', () => openMenu())
-  GridLayout.setColumn(overflow, 4); header.addChild(overflow); root.addChild(header)
+  GridLayout.setColumn(overflow, 4); header.addChild(overflow); glassesView.addChild(header)
+  const deviceCard = new GridLayout()
+  deviceCard.rows = 'auto,auto'; deviceCard.columns = '*,auto'
+  deviceCard.className = 'device-status-card'; deviceCard.accessible = true
+  deviceCard.accessibilityRole = 'button'; deviceCard.accessibilityLabel = 'Open glasses connection details'
+  deviceCard.on('tap', () => { void openDevices() })
+  const deviceName = new Label()
+  deviceName.text = glassesModelName(); deviceName.className = 'device-name'
+  const state = new Label()
+  state.text = 'Preview'; state.className = 'device-connection-state'
+  state.verticalAlignment = 'middle'; GridLayout.setColumn(state, 1)
+  const batterySummary = new Label()
+  batterySummary.text = 'Battery levels unavailable'; batterySummary.className = 'device-battery-summary'
+  batterySummary.textWrap = true; batterySummary.accessibilityIdentifier = 'device-battery-summary'
+  GridLayout.setRow(batterySummary, 1); GridLayout.setColumnSpan(batterySummary, 2)
+  deviceCard.addChild(deviceName); deviceCard.addChild(state); deviceCard.addChild(batterySummary)
+  GridLayout.setRow(deviceCard, 1); glassesView.addChild(deviceCard)
   const body = new GridLayout()
-  GridLayout.setRow(body, 1); root.addChild(body)
+  body.className = 'glasses-content'; body.rows = 'auto,*'; body.columns = '*'
+  GridLayout.setRow(body, 2); glassesView.addChild(body)
+  const previewSection = new GridLayout()
+  previewSection.rows = 'auto,*'; previewSection.className = 'glasses-section preview-section'
+  const previewTitle = new Label()
+  previewTitle.text = 'On your glasses'; previewTitle.className = 'companion-section-title'
+  previewSection.addChild(previewTitle)
   const mirror = new Image()
   mirror.stretch = 'fill'; mirror.backgroundColor = new Color('black')
   mirror.accessibilityIdentifier = 'glasses-preview'
   mirror.accessibilityLabel = 'Interactive glasses screen preview'
-  mirror.horizontalAlignment = 'left'; mirror.verticalAlignment = 'middle'; body.addChild(mirror)
-  // Load exactly the same XML and binding model as Android. Only input dispatch
-  // and the surrounding platform navigation/runtime remain iOS-specific.
+  mirror.horizontalAlignment = 'left'; mirror.verticalAlignment = 'middle'; mirror.className = 'glasses-preview'
+  GridLayout.setRow(mirror, 1); previewSection.addChild(mirror); body.addChild(previewSection)
+  // The iOS presentation keeps the shared remote model and gesture bindings.
   const model = new RemoteControlsViewModel()
+  const controlsSection = new GridLayout()
+  controlsSection.rows = 'auto,*'; controlsSection.className = 'glasses-section remote-section'
+  const remoteTitle = new Label()
+  remoteTitle.text = 'REMOTE'; remoteTitle.className = 'section-eyebrow'
+  controlsSection.addChild(remoteTitle)
   const controls = new GridLayout()
   const remote = Builder.load('~/phone-ui/remote-controls')
   remote.bindingContext = model
-  controls.addChild(remote); body.addChild(controls)
+  controls.addChild(remote); GridLayout.setRow(controls, 1); controlsSection.addChild(controls)
+  GridLayout.setRow(controlsSection, 1); body.addChild(controlsSection)
   const keyboardModel = new KeyboardInputViewModel()
   const keyboardPanel = Builder.load('~/phone-ui/keyboard-input-panel')
   keyboardPanel.bindingContext = keyboardModel
-  GridLayout.setRow(keyboardPanel, 1); root.addChild(keyboardPanel)
+  GridLayout.setRow(keyboardPanel, 0)
+  let companionTabs: TabView | null = null
   let focusTimer: ReturnType<typeof setTimeout> | null = null
   // The Settings tab's battery row. iOS reports charging sessions as
   // connected, so "connected" is the whole live-link condition here.
   let glassesLinked = false
-  const refreshBatteryLine = () => { model.batteryLine = formatBatteryLine(shell.getBatteryLevels(), glassesLinked, glassesModelName()) }
+  const refreshBatteryLine = () => {
+    const line = formatBatteryLine(shell.getBatteryLevels(), glassesLinked, glassesModelName())
+    model.batteryLine = line
+    batterySummary.text = line || 'Battery levels unavailable'
+    compactState.text = `${state.text} · ${batterySummary.text}`
+  }
   const keyboardField = () => keyboardPanel.getViewById<TextView>('keyboardInputField')
+  let foreground = false, lastConnectionPhase = ''
+  let refreshCompanionPanels = () => {}
   const controller = new IosPreviewController((image, label) => {
     mirror.imageSource = image; model.set('padFocusLine', label)
   }, message => {
     void Dialogs.alert({ title: 'Faceclaw', message, okButtonText: 'OK' })
   }, connection => {
+    const phaseChanged = connection.phase !== lastConnectionPhase
+    lastConnectionPhase = connection.phase
     state.text = ({ connected: 'Connected', disconnected: 'Preview', connecting: 'Connecting',
       retrying: 'Reconnecting', disconnecting: 'Disconnecting', error: 'Failed' })[connection.phase]
     warning.visibility = connection.firmwareWarning ? 'visible' : 'collapse'
     glassesLinked = connection.phase === 'connected'; refreshBatteryLine()
+    if (foreground && phaseChanged) refreshCompanionPanels()
   }, session => {
     keyboardModel.setSession(session)
     controls.visibility = session ? 'collapse' : 'visible'
     if (focusTimer !== null) clearTimeout(focusTimer)
     focusTimer = null
     if (session) {
+      if (companionTabs) companionTabs.selectedIndex = 0
       focusTimer = setTimeout(() => { focusTimer = null; keyboardField()?.focus() }, 0)
     } else keyboardField()?.dismissSoftInput()
   }, button => {
@@ -119,7 +195,7 @@ export function createMainPage(): Page {
     }
     if (configured) add(connected ? 'Disconnect' : 'Connect', () => {
       if (connected) { suppressAutoReconnect(); void controller.disconnect() }
-      else { resumeAutoReconnect(); void controller.connect() }
+      else { resumeAutoReconnect(); void controller.connect(false, true) }
     })
     add('Pair glasses', () => { void navigateDevicePage('phone-ui/onboarding-unpair-page') })
     add('Permissions', () => Frame.topmost()?.navigate({ moduleName: 'phone-ui/permissions-page' }))
@@ -168,10 +244,34 @@ export function createMainPage(): Page {
       } else {
         Frame.topmost()?.navigate({ moduleName: 'phone-ui/onboarding-flash-page', context: { mode: choice === 'Uninstall custom firmware' ? 'uninstall' : 'install', fromOnboarding: false } })
       }
-    } else if (choice === 'Connect') { resumeAutoReconnect(); await controller.connect() }
+    } else if (choice === 'Connect') { resumeAutoReconnect(); await controller.connect(false, true) }
     else if (choice === 'Disconnect') { suppressAutoReconnect(); await controller.disconnect() }
     else if (choice === 'Connection details') await Dialogs.alert({ title: 'Connection details', message: controller.connectionDetails, okButtonText: 'OK' })
   }
+  const panels = createCompanionPanels({
+    launchApp: (id, params) => controller.launchApp(id, params),
+    openDevices,
+    openPermissions: () => { Frame.topmost()?.navigate({ moduleName: 'phone-ui/permissions-page' }) },
+    openAdvanced: openMenu,
+  })
+  refreshCompanionPanels = () => panels.refresh()
+  companionTabs = new TabView()
+  companionTabs.className = 'companion-tabs'
+  companionTabs.accessibilityIdentifier = 'companion-tabs'
+  companionTabs.items = [
+    Object.assign(new TabViewItem(), { title: 'Glasses', view: glassesView }),
+    Object.assign(new TabViewItem(), { title: 'Health', view: panels.health }),
+    Object.assign(new TabViewItem(), { title: 'Apps', view: panels.apps }),
+    Object.assign(new TabViewItem(), { title: 'Settings', view: panels.settings }),
+  ]
+  let previousCompanionTab = companionTabs.selectedIndex
+  companionTabs.on('selectedIndexChanged', () => {
+    if (previousCompanionTab === 3 && companionTabs?.selectedIndex !== 3) panels.clearSettings()
+    previousCompanionTab = companionTabs?.selectedIndex ?? 0
+    panels.refresh()
+  })
+  root.addChild(companionTabs)
+  root.addChild(keyboardPanel)
   const watchInput = new PhoneGestureRecognizer(gesture => controller.gesture(gesture, 'watch'))
   const ringInput = new PhoneGestureRecognizer(gesture => controller.gesture(gesture, 'ring'))
   const mirrorInput = new PhoneGestureRecognizer((gesture, x, y) => {
@@ -209,10 +309,9 @@ export function createMainPage(): Page {
   bandwidth.className = 'ble-bandwidth-indicator'; bandwidth.isUserInteractionEnabled = false
   bandwidth.horizontalAlignment = 'center'; bandwidth.verticalAlignment = 'bottom'
   bandwidth.visibility = 'collapse'
-  GridLayout.setRow(bandwidth, 1); root.addChild(bandwidth)
+  GridLayout.setRow(bandwidth, 0); root.addChild(bandwidth)
   const bandwidthMeter = new BleBandwidthMeter()
   let bandwidthTimer: ReturnType<typeof setInterval> | null = null
-  let foreground = false
   function stopBandwidth(): void {
     if (bandwidthTimer !== null) clearInterval(bandwidthTimer)
     bandwidthTimer = null; bandwidthMeter.reset()
@@ -234,13 +333,18 @@ export function createMainPage(): Page {
     const key = `${size.width}:${size.height}:${landscape}`
     if (key === lastLayout) return
     lastLayout = key; cancelGestures()
-    body.className = landscape ? 'landscape-layout' : ''
+    deviceCard.visibility = landscape ? 'collapse' : 'visible'
+    compactState.visibility = landscape ? 'visible' : 'collapse'
+    body.className = landscape ? 'glasses-content landscape-layout' : 'glasses-content'
     root.className = landscape ? 'main-landscape' : ''
-    body.rows = landscape ? '*' : 'auto,*'; body.columns = landscape ? '*,345' : '*'
-    controls.padding = landscape ? 0 : 20
-    GridLayout.setRow(controls, landscape ? 0 : 1); GridLayout.setColumn(controls, landscape ? 1 : 0)
-    const width = landscape ? Math.max(0, Math.min(size.width - 345, size.height * 4 / 3)) : size.width
-    mirror.width = width; mirror.height = width * 3 / 4
+    const geometry = companionGeometry(size.width, size.height, landscape)
+    previewSection.visibility = geometry.showPreview ? 'visible' : 'collapse'
+    body.rows = landscape || !geometry.showPreview ? '*' : 'auto,*'
+    body.columns = landscape && geometry.showPreview ? '*,345' : '*'
+    GridLayout.setRow(previewSection, 0); GridLayout.setColumn(previewSection, 0)
+    GridLayout.setRow(controlsSection, landscape || !geometry.showPreview ? 0 : 1)
+    GridLayout.setColumn(controlsSection, landscape && geometry.showPreview ? 1 : 0)
+    mirror.width = geometry.mirrorWidth; mirror.height = geometry.mirrorHeight
   }
   // iOS emits layoutChanged inside its layout pass. Defer mutations so
   // NativeScript does not clear our new layout request at the end of that pass.
@@ -251,6 +355,7 @@ export function createMainPage(): Page {
   })
   const pause = () => {
     foreground = false; stopBandwidth()
+    panels.clearHealth()
     if (layoutTimer !== null) clearTimeout(layoutTimer)
     layoutTimer = null
     if (controlsLayoutTimer !== null) clearTimeout(controlsLayoutTimer)
@@ -260,10 +365,19 @@ export function createMainPage(): Page {
     keyboardField()?.dismissSoftInput()
     cancelGestures(); controller.pause()
   }
-  const resume = () => { foreground = true; controller.resume(); syncBandwidth() }
+  const resume = () => { foreground = true; panels.refresh(); controller.resume(); syncBandwidth() }
   let keyboardObserver: any = null
   let offSettings: (() => void) | null = null
   let offBattery: (() => void) | null = null
+  function applyTabSymbols(): void {
+    const nativeItems = companionTabs?.ios?.tabBar?.items
+    const imageType = (globalThis as any).UIImage
+    if (!nativeItems || !imageType?.systemImageNamed) return
+    ;['eyeglasses', 'heart', 'square.grid.2x2', 'gearshape'].forEach((name, index) => {
+      const item = nativeItems.objectAtIndex ? nativeItems.objectAtIndex(index) : nativeItems[index]
+      if (item) item.image = imageType.systemImageNamed(name)
+    })
+  }
   page.on('loaded', () => {
     if (!keyboardObserver) keyboardObserver = NSNotificationCenter.defaultCenter.addObserverForNameObjectQueueUsingBlock(
       UIKeyboardWillChangeFrameNotification, null, NSOperationQueue.mainQueue, notification => {
@@ -273,9 +387,11 @@ export function createMainPage(): Page {
         root.paddingBottom = Math.max(0, view.bounds.size.height - local.origin.y - view.safeAreaInsets.bottom)
       })
     Application.on(Application.suspendEvent, pause); Application.on(Application.resumeEvent, resume)
-    offSettings?.(); offSettings = onAnySettingChanged(() => { model.refreshDisplayControls(); syncBandwidth() })
+    offSettings?.(); offSettings = onAnySettingChanged(() => {
+      deviceName.text = glassesModelName(); model.refreshDisplayControls(); panels.refresh(); syncBandwidth()
+    })
     offBattery?.(); offBattery = shell.onBatteryLevelsChanged(refreshBatteryLine)
-    model.refreshDisplayControls(); refreshBatteryLine(); resume()
+    model.refreshDisplayControls(); refreshBatteryLine(); panels.refresh(); applyTabSymbols(); resume()
     if (!isPreviewOnlyMode() && !isAutoReconnectSuppressed() && !deviceAddressError(loadDeviceAddresses())) void controller.connect()
   })
   page.on('unloaded', () => {

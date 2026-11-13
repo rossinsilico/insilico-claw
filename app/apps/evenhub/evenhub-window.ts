@@ -111,7 +111,14 @@ export function createEvenHubWindow(
     pushOverlay: (layer) => created.stack.push(layer),
     // The extended layout uses the full 576x452 app area ("max"); stock apps
     // stay in the 576x288 band ("medium").
-    setTallCanvas: (tall) => created.setHeightMode(tall ? "max" : "medium"),
+    setTallCanvas: (tall) => {
+      created.setHeightMode(tall ? "max" : "medium");
+      session.viewportChanged();
+    },
+    getViewport: () => {
+      const { width, height } = created.stack.getBaseSize();
+      return { width: Math.min(width, EVENHUB_SCREEN_WIDTH), height };
+    },
     setAttention: (attention) => shell.setWindowAttention(windowId, attention),
     // Only while the app listens for text: otherwise the shell's Type Into App
     // destinations (voice dialog, phone keyboard, watch) would send into a void.
@@ -122,6 +129,12 @@ export function createEvenHubWindow(
     iconChanged: requestShellRender,
     windowId,
   });
+
+  const baseRelayout = created.window.relayout;
+  created.window.relayout = () => {
+    baseRelayout?.();
+    session.viewportChanged();
+  };
 
   // LONG_PRESS_EVENT / LONG_PRESS_RELEASE_EVENT (SDK 0.0.14): the app hears
   // the context-menu gesture (tap-then-hold; a plain long-press is the

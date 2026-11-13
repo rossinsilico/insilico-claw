@@ -41,6 +41,11 @@ import kotlin.jvm.JvmStatic
  * surfaced raw rather than guessed at.
  */
 class RingProtocol private constructor() {
+    class HealthSettings internal constructor(
+        @JvmField val settingsTimeUtcSeconds: Long,
+        @JvmField val enabled: Boolean,
+    )
+
     companion object {
         /** CRC-32C polynomial, MSB-first / non-reflected form. Not CRC-32 (0x04C11DB7). */
         private const val CRC32C_POLY: Int = 0x1EDC6F41
@@ -275,6 +280,74 @@ class RingProtocol private constructor() {
         @JvmStatic
         fun buildPairAuth(seq: Int): ByteArray =
             buildCheckedFrame(CHAN_DEVICE, KIND_REQ, CMD_HI_DEVICE, CMD_LO_PAIR_AUTH, seq, byteArrayOf(0x01))
+
+        /** Read the persisted health-recording flag and its settings timestamp. */
+        @JvmStatic
+        fun buildHealthSettingsGet(seq: Int): ByteArray =
+            buildCheckedFrame(CHAN_DEVICE, KIND_REQ, CMD_HI_DEVICE, 0x0E, seq, EMPTY)
+
+        /** Explicit health-recording SET: UTC settings time, enable flag, seven reserved zero bytes. */
+        @JvmStatic
+        fun buildHealthSettingsSet(seq: Int, utcSeconds: Long, enabled: Boolean): ByteArray {
+            require(utcSeconds in 0..0xffff_ffffL) { "health settings time must fit UInt32" }
+            val args = ByteArray(12)
+            writeIntLe(args, 0, utcSeconds.toInt())
+            args[4] = if (enabled) 1 else 0
+            return buildCheckedFrame(CHAN_DEVICE, KIND_DATA, CMD_HI_DEVICE, 0x0E, seq, args)
+        }
+
+        /** Explicit clock SET: signed UTC-offset minutes followed by UTC epoch seconds. */
+        @JvmStatic
+        fun buildClockSet(seq: Int, utcOffsetMinutes: Int, utcSeconds: Long): ByteArray {
+            require(utcOffsetMinutes in -840..840) { "UTC offset minutes out of range" }
+            require(utcSeconds in 0..0xffff_ffffL) { "clock time must fit UInt32" }
+            val args = byteArrayOf(utcOffsetMinutes.toByte(), (utcOffsetMinutes ushr 8).toByte()) +
+                byteArrayOf(utcSeconds.toByte(), (utcSeconds ushr 8).toByte(),
+                    (utcSeconds ushr 16).toByte(), (utcSeconds ushr 24).toByte())
+            return buildCheckedFrame(CHAN_DEVICE, KIND_DATA, CMD_HI_DEVICE, 0x05, seq, args)
+        }
+
+        /**
+         * Validate a stock ring response and return its arguments.
+         *
+         * Responses use the stock model CRC-16/Modbus over the 12-byte model
+         * header (with its checksum field zeroed) plus the arguments. That is
+         * intentionally different from [phoneChecksum], which describes the
+         * phone-to-ring checked envelope.
+         */
+        @JvmStatic
+        fun parseSuccessfulResponse(frame: Frame?, command: Int, expectedArgsLength: Int): ByteArray? {
+            if (frame == null || !frame.crcOk || frame.chan != CHAN_DEVICE ||
+                frame.kind != KIND_RSP || frame.cmdHi != CMD_HI_DEVICE ||
+                frame.cmdLo != command || frame.payload.size != expectedArgsLength + 2) return null
+            val args = frame.payload.copyOfRange(2, frame.payload.size)
+            val stored = readUInt16Le(frame.payload, 0)
+            return if (stored == responseChecksum(frame, args)) args else null
+        }
+
+        /** Decode only the checked 12-byte body returned by device command 00:0E GET. */
+        @JvmStatic
+        fun parseHealthSettingsResponse(frame: Frame?): HealthSettings? {
+            val args = parseSuccessfulResponse(frame, 0x0E, 12) ?: return null
+            return HealthSettings(readUInt32Le(args, 0), args[4].toInt() != 0)
+        }
+
+        private fun responseChecksum(frame: Frame, args: ByteArray): Int {
+            val modelLength = 12 + args.size
+            val model = byteArrayOf(
+                MAGIC.toByte(), frame.chan.toByte(), MAGIC.toByte(), frame.seq.toByte(), 0,
+                frame.kind.toByte(), frame.cmdHi.toByte(), frame.cmdLo.toByte(),
+                modelLength.toByte(), (modelLength ushr 8).toByte(), 0, 0,
+            ) + args
+            var crc = 0xffff
+            for (byte in model) {
+                crc = crc xor (byte.toInt() and 0xff)
+                repeat(8) {
+                    crc = if ((crc and 1) != 0) (crc ushr 1) xor 0xa001 else crc ushr 1
+                }
+            }
+            return crc and 0xffff
+        }
 
         /**
          * advStart (00:0A): the two glasses addresses the ring will accept as
@@ -558,8 +631,8 @@ class RingProtocol private constructor() {
          * A sleep session. The ring transmits pre-classified stages, per-stage
          * totals and the session boundaries; nothing is computed phone-side.
          *
-         * `startTs`/`endTs` are ring-relative seconds, NOT Unix
-         * timestamps — see [SleepRecord].
+         * `startTs`/`endTs` are ring-reported seconds; treating modern values
+         * as UTC requires clock validation — see [SleepRecord].
          */
         @JvmStatic
         fun decodeSleep(frame: Frame, receivedAtMs: Long): SleepRecord? {
@@ -578,6 +651,8 @@ class RingProtocol private constructor() {
             }
             if (pay.size < 34) return null
 
+            val temperatureRaw = readUInt16Le(pay, 10).takeIf { it != 0 }
+            val utcOffsetMinutes = readUInt16Le(pay, 12).toShort().toInt()
             val startTs = readUInt32Le(pay, 14)
             val endTs = readUInt32Le(pay, 18)
             val totalTime = readUInt16Le(pay, 22)
@@ -601,7 +676,8 @@ class RingProtocol private constructor() {
             }
             return SleepRecord(
                 receivedAtMs, recordState, unknownA, unknownTag,
-                startTs, endTs, totalTime, wakeTime, remTime, lightTime, deepTime, segments)
+                startTs, endTs, totalTime, wakeTime, remTime, lightTime, deepTime, segments,
+                temperatureRaw, utcOffsetMinutes)
         }
 
         /**
@@ -977,13 +1053,12 @@ class RingProtocol private constructor() {
     /**
      * One sleep session.
      *
-     * **[startTs] and [endTs] are ring-relative seconds, not Unix time.**
-     * Even's own app gets this wrong and stamps live-pushed sessions with
-     * timestamps in 1979. Do not feed them to a date formatter.
+     * [startTs] and [endTs] are ring-reported seconds. Modern UTC values require
+     * clock validation before callers treat them as absolute timestamps.
      *
-     * **UNSOLVED:** [unknownPrefix] (6 bytes) and [unknownTag] (u32) are not
-     * decoded; one of them probably carries the session date, which would
-     * remove the anchoring problem. They are stored raw rather than interpreted.
+     * [unknownPrefix] and the legacy overlapping [unknownTag] remain raw for
+     * compatibility; [unknownTag] includes bytes now decoded as temperature and
+     * UTC offset and is not a separate semantic field.
      */
     class SleepRecord internal constructor(
         receivedAtMs: Long,
@@ -991,11 +1066,11 @@ class RingProtocol private constructor() {
         @JvmField val recordState: Int,
         /** UNSOLVED per-record 6-byte field (payload[3:9]). Stored raw. */
         @JvmField val unknownPrefix: ByteArray,
-        /** UNSOLVED u32 tag (payload[9:13]). Stored raw. */
+        /** Legacy overlapping u32 header view (payload[9:13]). Stored raw. */
         @JvmField val unknownTag: Long,
-        /** Ring-relative seconds, NOT Unix. */
+        /** Ring-reported seconds; modern UTC interpretation requires clock validation. */
         @JvmField val startTs: Long,
-        /** Ring-relative seconds, NOT Unix. */
+        /** Ring-reported seconds; modern UTC interpretation requires clock validation. */
         @JvmField val endTs: Long,
         @JvmField val totalTime: Int,
         @JvmField val wakeTime: Int,
@@ -1009,6 +1084,10 @@ class RingProtocol private constructor() {
          * [halfMinutesForStage].
          */
         @JvmField val segments: Array<SleepSegment>,
+        /** Raw ring temperature field; zero means unavailable and is exposed as null. */
+        @JvmField val temperatureRaw: Int? = null,
+        /** Signed UTC offset in minutes reported with this record. */
+        @JvmField val utcOffsetMinutes: Int? = null,
     ) : HealthRecord(CMD_HI_SLEEP, receivedAtMs) {
         fun isRealRecord(): Boolean = recordState == 1
 

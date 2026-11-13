@@ -117,7 +117,8 @@ The [API reference](https://github.com/jimrandomh/faceclaw/blob/main/evenhub-ext
 | `requestApiKeyAccess(services)` | Ask the user, on the glasses, to share those keys with the app. |
 | `playBuzzer(steps)` | Play a tone sequence on the glasses' buzzer. |
 | `addCompassListener(fn)` | Turn on the magnetometer and receive headings. |
-| `createLayout(layout)` / `replaceLayout(layout)` | Build the page on the full 576×452 canvas, with no container limit, and optionally keep content across layouts. |
+| `createLayout(layout, options?)` / `replaceLayout(layout, options?)` | Build an extended page. The default keeps the full-height legacy behavior; `{ heightMode: "current" }` follows the user's current window mode. |
+| `getViewport()` / `addViewportListener(listener)` | Feature-detected current app-content size and resize events for responsive layouts. |
 | `setAssistantTools(tools)` | Offer tools to Faceclaw's voice assistant. |
 | `addTouchDownListener(fn)` | Hear the moment a finger touches the ring or watch, before the gesture is known. |
 | `addTextInputListener(fn)` | Receive dictated or typed text: the app becomes a "Type Into App" destination. |
@@ -126,7 +127,8 @@ The [API reference](https://github.com/jimrandomh/faceclaw/blob/main/evenhub-ext
 | `setAttention(on)` | Show or clear the attention dot on the app's switcher icon. |
 | `setKeepScreenOn(on)` | Stop the display from sleeping for inactivity while the app is in front. |
 | `getFonts()` | List the font families available to text and list containers. |
-| `measureText(text, font)` | Measure text in a font, to size or centre it. |
+| `measureText(text, font?, options?)` | Measure text in the drawn font and optionally wrap a whole block with `maxWidth`. |
+| `addTypographyListener(listener)` | Feature-detected notification after the global UI font changes. |
 
 The package also exports `getInputSource(event)`, which tells you which device
 (`ring`, `left-touchpad`, `right-touchpad` or `watch`) produced a stock gesture
@@ -190,9 +192,13 @@ can install more fonts, and `getFonts()` lists everything available. An
 unknown family falls back to Roboto, and the nearest available weight and
 (for bitmap fonts) size are used.
 
-`measureText(text, font)` returns the text's width and line height in a
-font, so you can size containers or centre text. A list row is the font's
-line height plus 12 pixels.
+`measureText(text, font?, options?)` returns the text's width, line height and
+the global font revision used. With no font it uses the user's global UI font;
+pass `{ family: "EvenHub" }` for the stock face. With
+`{ maxWidth: width }`, it also returns `lines` wrapped by the same face and
+algorithm containers use. A list row is the font's line height plus 12 pixels.
+Feature-detect `addTypographyListener` to remeasure after the global font
+changes; older hosts simply keep their original metrics.
 
 ### Input sources and touch-down
 

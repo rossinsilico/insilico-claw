@@ -24,6 +24,7 @@ function harness({ authorization = NOT_DETERMINED, onboarding = true } = {}) {
     },
   };
   const alerts = [];
+  let healthRequests = 0;
   const timers = [];
   const appListeners = new Set();
   const load = loader({
@@ -50,12 +51,13 @@ function harness({ authorization = NOT_DETERMINED, onboarding = true } = {}) {
     '../native/file-access': {},
     '../native/notification-access': {},
     '../native/media-controller': { mediaControllerBridge: { hasAccess: () => false, requestAccess: async () => false } },
+    '../native/apple-health': { requestAppleHealthAccess: async () => { healthRequests++; return { requestCompleted: true }; } },
   });
   const { PermissionsViewModel } = load('app/phone-ui/permissions-view-model.ts');
   const model = new PermissionsViewModel({ onboarding });
   const card = () => model.cards.find(item => item.id === 'nearby-devices');
   return {
-    central, alerts, timers, appListeners, model, card,
+    central, alerts, timers, appListeners, model, card, healthRequests: () => healthRequests,
     checked: () => card().checkVisibility === 'visible',
     tap: () => card().onCardTap({ object: { bindingContext: card() } }),
     flush: () => new Promise(resolve => setImmediate(resolve)),
@@ -77,6 +79,20 @@ test('opening the page does not prompt; tapping the card does, and allowing chec
   assert.equal(page.checked(), true);
   assert.equal(page.model.primaryClass, '-primary');
   assert.equal(page.alerts.length, 0);
+});
+
+test('Apple Health is reviewable from iPhone permissions without implying blanket read access', async () => {
+  const page = harness({ authorization: ALLOWED, onboarding: false });
+  const health = () => page.model.cards.find(item => item.id === 'apple-health');
+  assert.ok(health());
+  assert.equal(health().optionalVisibility, 'visible');
+  assert.equal(health().checkVisibility, 'collapse');
+  assert.equal(page.healthRequests(), 0);
+  health().onCardTap({ object: { bindingContext: health() } });
+  await page.flush();
+  assert.equal(page.healthRequests(), 1);
+  assert.equal(health().checkVisibility, 'collapse', 'request completion does not reveal read authorization');
+  assert.match(page.alerts[0], /Health app.*profile.*Apps/i);
 });
 
 test('Bluetooth already allowed is checked on the first render, with no central and no prompt', () => {

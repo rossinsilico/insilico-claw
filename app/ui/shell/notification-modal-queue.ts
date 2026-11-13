@@ -90,6 +90,8 @@ export class NotificationModalQueue<M> {
     return this.queued.map((entry) => entry.notificationKey);
   }
 
+  currentModal(): M | null { return this.current?.modal ?? null; }
+
   private openNext(wokeScreen: boolean): boolean {
     while (this.queued.length > 0) {
       const next = this.queued.shift()!;

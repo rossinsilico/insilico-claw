@@ -83,6 +83,17 @@ export interface WindowLifecycleEvent {
   type: WindowLifecycleEventType;
 }
 
+/** The app-content area currently available to an EvenHub window. */
+export interface WindowViewport {
+  width: number;
+  height: number;
+}
+
+/** Extended-layout window sizing. Omit it to preserve the legacy max-height behavior. */
+export interface LayoutOptions {
+  heightMode?: "max" | "current";
+}
+
 /**
  * An image for {@link FaceclawExtensions.setWindowIcon}. An `ImageData` (from
  * a canvas's `getImageData`) fits this shape and can be passed directly.
@@ -290,6 +301,22 @@ export interface TextMeasurement {
   /** Width in pixels of the widest line (lines are split at `\n`). */
   width: number;
   /** Height in pixels of one line. A text container advances by this much per line. */
+  lineHeight: number;
+  /** Global UI-font revision used for this measurement. Absent on older hosts. */
+  revision?: number;
+  /** Wrapped lines, present when `maxWidth` was requested. */
+  lines?: string[];
+}
+
+/** Optional whole-block measurement behavior. */
+export interface TextMeasureOptions {
+  /** Wrap the text to this pixel width with the same face containers draw. */
+  maxWidth?: number;
+}
+
+/** A global UI-font change, delivered after the host invalidates its font cache. */
+export interface TypographyChange {
+  revision: number;
   lineHeight: number;
 }
 
@@ -572,6 +599,12 @@ export interface FaceclawExtensions {
    */
   addWindowLifecycleListener(listener: (event: WindowLifecycleEvent) => void): () => void;
 
+  /** Read the current app-content viewport when the host supports responsive layouts. */
+  getViewport?(): Promise<WindowViewport>;
+
+  /** Subscribe to actual viewport changes. Feature-detect for older Faceclaw hosts. */
+  addViewportListener?(listener: (viewport: WindowViewport) => void): () => void;
+
   /**
    * List the services whose API keys the user has configured in Faceclaw. This
    * returns only the service names, never the keys, and doesn't prompt the user.
@@ -627,7 +660,7 @@ export interface FaceclawExtensions {
    *
    * @returns A promise that resolves to true on success.
    */
-  createLayout(layout: FaceclawLayout): Promise<boolean>;
+  createLayout(layout: FaceclawLayout, options?: LayoutOptions): Promise<boolean>;
 
   /**
    * Replace the current page with a new extended layout. This is a superset of
@@ -636,7 +669,7 @@ export interface FaceclawExtensions {
    *
    * @returns A promise that resolves to true on success.
    */
-  replaceLayout(layout: FaceclawLayout): Promise<boolean>;
+  replaceLayout(layout: FaceclawLayout, options?: LayoutOptions): Promise<boolean>;
 
   /**
    * Declare the app's voice-assistant tools, replacing any set earlier. Each
@@ -716,14 +749,21 @@ export interface FaceclawExtensions {
 
   /**
    * Measure text as a container with this font would draw it, for example to
-   * size a text container or centre a label.
+   * size a text container, centre a label, or wrap a whole text block.
    *
    * @param text - The text. Lines split at `\n` are measured separately.
    * @param font - The font to measure in. Unlike a container's font, it
-   *   isn't combined with a layout default. Omit it to measure in the stock
-   *   font.
+   *   isn't combined with a layout default. Omit it to use the global UI font.
+   * @param options - Pass `maxWidth` to return wrapped `lines` from the same
+   *   face and wrapping algorithm used by containers.
    */
-  measureText(text: string, font?: FaceclawFont): Promise<TextMeasurement>;
+  measureText(text: string, font?: FaceclawFont, options?: TextMeasureOptions): Promise<TextMeasurement>;
+
+  /**
+   * Subscribe to global UI-font changes. Feature-detect for older Faceclaw hosts.
+   * The callback runs after the changed font is available to `measureText`.
+   */
+  addTypographyListener?(listener: (event: TypographyChange) => void): () => void;
 }
 
 declare global {

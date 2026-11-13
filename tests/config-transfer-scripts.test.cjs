@@ -62,6 +62,7 @@ test('settings stored outside FaceclawSettings are the ones the Android config p
     // iOS-only: NSUserDefaults holds every setting there.
     ['app/native/ios-bluetooth.ts', null],
     ['app/native/settings-store.ios.ts', null],
+    ['app/health/ring-session.ios.ts', null],
   ]);
   const users = [];
   const walk = (dir) => {

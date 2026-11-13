@@ -56,6 +56,52 @@ function harness() {
   return { settings, GlanceBoard, values, listeners, live, glasses, notify: () => [...listeners].forEach((listener) => listener()) };
 }
 
+function dashboardSettingsFixture(store = new Map()) {
+  const context = { exports: {}, global: { isIOS: true }, require: id => {
+    if (id.includes('settings-store')) return {
+      onSettingsStoreChanged() {}, getStringSetting: (key, fallback) => store.get(key) ?? fallback,
+      setStringSetting: (key, value) => store.set(key, value),
+      getBooleanSetting: (key, fallback) => store.get(key) ?? fallback,
+      setBooleanSetting: (key, value) => store.set(key, value),
+    };
+    if (id.includes('brightness-curve')) return require('../.test-build/app/g2/brightness-curve.js');
+    if (id.includes('animation-speed')) return require('../.test-build/app/ui/animation-speed.js');
+    return { Layer: class {}, ASSISTANT_MODEL_CHOICES: [] };
+  } };
+  vm.runInNewContext(ts.transpileModule(fs.readFileSync('app/ui/dashboard-settings.ts', 'utf8'), {
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 },
+  }).outputText, context);
+  return context.exports;
+}
+
+test('head-up settings retain the old master identity and migrate Show until explicitly selected', () => {
+  const disabled = dashboardSettingsFixture();
+  assert.equal(disabled.glanceShowOnHeadTiltSetting.id, 'glanceboard-show-on-head-tilt');
+  assert.equal(disabled.glanceShowOnHeadTiltSetting.storageKey, 'glanceboard.showOnHeadTilt');
+  assert.equal(disabled.glanceShowOnHeadTiltSetting.get(), true);
+  assert.equal(disabled.headUpTargetSetting.get(), 'last-app');
+
+  const store = new Map([['glanceboard.enabled', true]]);
+  const enabled = dashboardSettingsFixture(store);
+  assert.equal(enabled.headUpTargetSetting.get(), 'glanceboard');
+  assert.equal(store.get('display.headUpTarget'), 'glanceboard');
+  store.set('glanceboard.enabled', false);
+  assert.equal(enabled.headUpTargetSetting.get(), 'glanceboard');
+  enabled.headUpTargetSetting.set('last-app');
+  assert.equal(store.get('display.headUpTarget'), 'last-app');
+  assert.equal(enabled.headUpTargetSetting.get(), 'last-app');
+});
+
+test('glanceboard settings re-export the canonical head-up setting objects', () => {
+  const dashboard = dashboardSettingsFixture();
+  const settings = load('app/apps/glanceboard/glanceboard-settings.ts', {
+    '../../ui/dashboard-settings': dashboard, './layout': layout,
+    './widgets': { glanceWidgetSpans: () => false },
+  });
+  assert.equal(settings.glanceShowOnHeadTiltSetting, dashboard.glanceShowOnHeadTiltSetting);
+  assert.equal(settings.headUpTargetSetting, dashboard.headUpTargetSetting);
+});
+
 test('layout defaults to 2x2; expanding preserves stored slots and remembers the extra row', () => {
   const { settings: s, values } = harness();
   values.set('glanceboard.quadrants.slot.0', 'compass');

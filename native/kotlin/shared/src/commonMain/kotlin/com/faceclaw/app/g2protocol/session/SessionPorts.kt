@@ -63,6 +63,12 @@ interface SessionLink {
 
     fun disconnect(address: String)
 
+    /** Disconnect and wait for the platform's actual link-cancel completion. */
+    fun disconnectAndAwait(address: String, timeoutMs: Int): Boolean {
+        disconnect(address)
+        return !isConnected(address)
+    }
+
     fun close()
 
     /** Whether the OS still holds a pairing bond for the address (iOS: always true). */
@@ -140,6 +146,9 @@ interface SessionHost {
      * one, ring notifications only feed the gesture decoder.
      */
     fun supportsRingHealth(): Boolean = false
+
+    /** Explicit retrieval only: no automatic pulls, recording enable, clock or binding writes. */
+    fun ringHealthReadOnly(): Boolean = false
 
     /**
      * Durably append one line to the private ring-frame journal (health/ring-frames.jsonl in

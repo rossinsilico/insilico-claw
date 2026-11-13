@@ -1,0 +1,18 @@
+<Page xmlns="http://schemas.nativescript.org/tns.xsd" navigatingTo="navigatingTo" class="notification-settings-page">
+    <ActionBar title="Notifications" />
+    <GridLayout rows="auto,*">
+        <Label row="0" class="notification-settings-note" text="Choose how each app appears on your glasses. Popups also follow Display new notifications." textWrap="true" />
+        <GridLayout row="1">
+            <Label class="notification-settings-empty" text="Apps appear here after they send a notification." textWrap="true" visibility="{{ emptyVisibility }}" />
+            <ListView items="{{ sources }}" itemTap="{{ onSourceTap }}" iosEstimatedRowHeight="68">
+                <ListView.itemTemplate>
+                    <GridLayout rows="auto,auto,auto" class="notification-source-row" accessible="true" accessibilityRole="button" accessibilityLabel="{{ accessibilityLabel }}" accessibilityIdentifier="{{ packageName }}">
+                        <Label row="0" class="notification-source-name" text="{{ appName }}" textWrap="true" />
+                        <Label row="1" class="notification-source-summary" text="{{ summary }}" />
+                        <Label row="2" class="notification-source-package" text="{{ packageLabel }}" textWrap="true" visibility="{{ packageVisibility }}" />
+                    </GridLayout>
+                </ListView.itemTemplate>
+            </ListView>
+        </GridLayout>
+    </GridLayout>
+</Page>

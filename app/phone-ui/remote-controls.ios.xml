@@ -1,0 +1,52 @@
+<GridLayout xmlns="http://schemas.nativescript.org/tns.xsd" rows="auto,auto,*" class="remote-controls ios-remote-controls">
+  <GridLayout row="0" columns="*,*,*" class="remote-mode-picker">
+    <Button col="0" text="Display" textWrap="false" tap="{{ onSettingsTabTap }}" class="{{ settingsTabClass }}" />
+    <Button col="1" text="Watch" textWrap="false" tap="{{ onWatchTabTap }}" class="{{ watchTabClass }}" />
+    <Button col="2" text="Ring" textWrap="false" tap="{{ onRingTabTap }}" class="{{ ringTabClass }}" />
+  </GridLayout>
+
+  <GridLayout row="1" columns="*,*" class="remote-action-row">
+    <GridLayout col="0" columns="auto,*" accessible="true" accessibilityRole="button" accessibilityLabel="Speak to glasses" tap="{{ onSyntheticMicTap }}" class="remote-action">
+      <Image col="0" src="res://ic_tab_mic" class="remote-action-icon" verticalAlignment="center" />
+      <Label col="1" text="Speak" class="remote-action-label" verticalAlignment="center" />
+    </GridLayout>
+    <GridLayout col="1" columns="auto,*" accessible="true" accessibilityRole="button" accessibilityLabel="Type on glasses" tap="{{ onKeyboardTap }}" class="remote-action">
+      <Image col="0" src="res://ic_tab_keyboard" class="remote-action-icon" verticalAlignment="center" />
+      <Label col="1" text="Type" class="remote-action-label" verticalAlignment="center" />
+    </GridLayout>
+  </GridLayout>
+
+  <GridLayout row="2" layoutChanged="{{ onControlsContentLayoutChanged }}" class="remote-mode-content">
+    <StackLayout visibility="{{ settingsTabVisibility }}" class="remote-display-settings">
+      <GridLayout columns="auto,*" class="settings-row">
+        <Label col="0" text="Display mode" class="settings-row-label" verticalAlignment="center" />
+        <Button col="1" text="{{ displayModeLabel }}" tap="{{ onDisplayModeTap }}" class="mode-button" horizontalAlignment="left" />
+      </GridLayout>
+      <GridLayout columns="auto,*,auto" class="settings-row">
+        <Label col="0" text="Brightness" class="settings-row-label" verticalAlignment="center" />
+        <Slider col="1" width="100%" minValue="2" maxValue="100" value="{{ brightnessPercent }}" valueChange="{{ onBrightnessChange }}" isEnabled="{{ brightnessSliderEnabled }}" />
+        <StackLayout col="2" orientation="horizontal" verticalAlignment="center" class="auto-toggle">
+          <Label text="Auto" verticalAlignment="center" />
+          <Switch checked="{{ brightnessAuto }}" checkedChange="{{ onBrightnessAutoChange }}" />
+        </StackLayout>
+      </GridLayout>
+    </StackLayout>
+
+    <GridLayout visibility="{{ watchTabVisibility }}" width="{{ watchFaceWidth }}" height="{{ watchFaceHeight }}" rows="*,auto,auto,auto,*" horizontalAlignment="center" verticalAlignment="center" class="touchpad" touch="{{ onPadTouch }}">
+      <Label row="1" isUserInteractionEnabled="false" text="{{ padFocusLine }}" class="{{ padFocusClass }}" horizontalAlignment="center" />
+      <Label row="2" isUserInteractionEnabled="false" text="●● wake" visibility="{{ padWakeHintVisibility }}" class="pad-wake-hint" horizontalAlignment="center" />
+      <Label row="3" isUserInteractionEnabled="false" text="{{ padDetailLine }}" visibility="{{ padDetailVisibility }}" class="pad-detail" horizontalAlignment="center" />
+    </GridLayout>
+
+    <GridLayout visibility="{{ ringTabVisibility }}" height="{{ ringTouchpadHeight }}" class="touchpad ring-touchpad"
+        rows="*,auto,*,auto,*,auto,*,auto,*,auto,*,auto,*"
+        horizontalAlignment="center" verticalAlignment="center" touch="{{ onRingPadTouch }}">
+      <Label row="1" class="ring-pad-marking" isUserInteractionEnabled="false" />
+      <Label row="3" class="ring-pad-marking" isUserInteractionEnabled="false" />
+      <Label row="5" class="ring-pad-marking" isUserInteractionEnabled="false" />
+      <Label row="7" class="ring-pad-marking" isUserInteractionEnabled="false" />
+      <Label row="9" class="ring-pad-marking" isUserInteractionEnabled="false" />
+      <Label row="11" class="ring-pad-marking" isUserInteractionEnabled="false" />
+    </GridLayout>
+  </GridLayout>
+</GridLayout>

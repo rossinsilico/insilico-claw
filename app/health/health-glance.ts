@@ -82,7 +82,7 @@ export type GlancePage =
   | { kind: "sleep" };
 
 /**
- * The cursor's order. Overview first, then the five measured parameters in the
+ * The cursor's order. Overview first, then the measured parameters in the
  * order the overview lists them, then sleep - so scrolling down walks the
  * summary top to bottom and falls off the end into last night, which is where
  * the overview's right-hand column already pointed.
@@ -93,6 +93,7 @@ export const GLANCE_PAGES: readonly GlancePage[] = [
   { kind: "metric", metric: "spo2" },
   { kind: "metric", metric: "hrv" },
   { kind: "metric", metric: "steps" },
+  { kind: "metric", metric: "activeCalories" },
   { kind: "metric", metric: "calories" },
   { kind: "sleep" },
 ];
@@ -204,7 +205,7 @@ function drawFooter(
  *     (`rangeAverageText`), which drops the "min / avg / max" legend line that
  *     existed only to decode the triple.
  *
- * What arrived: an HRV line, revising the first pass's spec.
+ * What arrived: the R1's filtered RMSSD statistic, revising the first pass's spec.
  *
  * The net is that this page is now TEXT ONLY - no charts, no graphics. The
  * charts did not die, they moved: the trace is the heart-rate drill-down page
@@ -304,7 +305,7 @@ function drawTodayColumn(image: GrayImage, summary: DailySummary, layout: Column
   const rows: [string, MetricSummary, string][] = [
     ["HR", summary.heartRate, SAMPLE_METRIC_UNITS.heartRate],
     ["SpO2", summary.spo2, SAMPLE_METRIC_UNITS.spo2],
-    ["HRV", summary.hrv, SAMPLE_METRIC_UNITS.hrv],
+    ["R1 RMSSD", summary.hrv, SAMPLE_METRIC_UNITS.hrv],
   ];
   for (const [label, metricSummary, unit] of rows) {
     image.drawText(small, x, y, label, INK.label);
@@ -382,11 +383,14 @@ function drawMetricDetail(
 
   const summary = summaryFor(metric, data.summary);
   const unit = SAMPLE_METRIC_UNITS[metric];
+  const points = data.hourly[metric] ?? [];
 
   if (isCumulativeMetric(metric)) {
-    // Steps and calories are totals, not measurements with a spread, so the
+    // Activity streams are totals, not measurements with a spread, so the
     // headline is the day's total rather than a range.
-    const total = metric === "steps" ? data.summary?.steps ?? 0 : data.summary?.calories ?? 0;
+    const total = metric === "steps" ? data.summary?.steps ?? 0
+      : metric === "calories" ? data.summary?.calories ?? 0
+      : points.reduce((sum, point) => sum + point.sum, 0);
     const text = total > 0 ? total.toLocaleString() : "--";
     image.drawText(large, MARGIN, y, text, INK.title);
     const width = large.measureText(text);
@@ -405,7 +409,6 @@ function drawMetricDetail(
     y += step + 4;
   }
 
-  const points = data.hourly[metric] ?? [];
   const footerHeight = small.lineHeight + 8;
   const chartHeight = size.height - y - MARGIN - footerHeight;
   if (chartHeight >= 40) {
@@ -437,10 +440,10 @@ function summaryFor(metric: SampleMetric, summary: DailySummary | null): MetricS
 }
 
 function isCumulativeMetric(metric: SampleMetric): boolean {
-  return metric === "steps" || metric === "calories";
+  return metric === "steps" || metric === "activeCalories" || metric === "calories";
 }
 
-/** "SpO2 · HRV" - what scrolling either way from here reaches. */
+/** The neighboring page labels shown in the footer. */
 function pageHint(metric: SampleMetric): string {
   const index = GLANCE_PAGES.findIndex(
     (page) => page.kind === "metric" && page.metric === metric,

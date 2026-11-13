@@ -14,6 +14,8 @@ export type AndroidNotification = {
   bigText: string; subText: string; infoText: string; summaryText: string;
   category: string; lines: string[]; postTime: number; when: number;
   actions: AndroidNotificationAction[]; dismissLabel?: string;
+  /** Relay policy keeps the item in the list without showing an interruption. */
+  suppressPopup?: boolean;
   /** Posted by a foreground service (Android): a "this app is working" status notification. */
   foregroundService?: boolean;
   /** Carries a picture (Android BigPictureStyle), fetched separately by readNotificationPicture. */

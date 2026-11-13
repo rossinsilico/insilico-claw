@@ -5,7 +5,7 @@ import { kotlinListener } from './kotlin-listener.ios'
 import type { G1FlasherOptions } from './g1-flasher'
 export type { G1FlashMode, G1FlasherOptions } from './g1-flasher'
 
-declare const FaceclawKitIosG1Flasher: any, FaceclawKitFaceclawFirmwareFlasherListener: any
+declare const NSBundle: any, FaceclawKitIosG1Flasher: any, FaceclawKitFaceclawFirmwareFlasherListener: any
 
 /** CoreBluetooth has no way to remove a pairing; iOS Settings does it. */
 export function forgetG1Pairing(_address: string): boolean {
@@ -39,6 +39,9 @@ export class G1Flasher {
   }
 
   run(): Promise<G1FlashResult> {
+    if (NSBundle.mainBundle.bundleIdentifier === 'com.rosspingatore.faceclawpilot' && this.options.mode !== 'probe') {
+      return Promise.reject(new Error('The FaceClaw Pilot cannot change glasses firmware. Use the separate recovery app for firmware updates.'))
+    }
     this.previousIdle = UIApplication.sharedApplication.idleTimerDisabled
     UIApplication.sharedApplication.idleTimerDisabled = true
     Application.on(Application.suspendEvent, this.backgrounded)

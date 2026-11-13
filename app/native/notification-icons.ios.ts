@@ -23,6 +23,8 @@ export function onIosNotificationPopup(listener: (key: string) => void): () => v
 }
 export function iosNotificationMessage(): string { return active?.statusMessage ?? ANCS_CONNECT_MESSAGE }
 export function iosNotificationState(): AncsState { return active?.state ?? 'disconnected' }
+export function isNotificationRelayReady(): boolean { return iosNotificationState() === 'ready' }
+export function notificationRelayMessage(): string { return iosNotificationMessage() }
 export function readActiveNotifications(maxNotifications = 50) { return active?.read(maxNotifications) ?? [] }
 export function invokeNotificationAction(key: string, index: number): boolean { return active?.action(key,index) ?? false }
 export function dismissNotification(key: string): boolean { return active?.dismiss(key) ?? false }
@@ -46,7 +48,7 @@ export function readActiveNotificationIcons(maxIcons: number, _allowStale: boole
   const sources = new Map<string, AndroidNotification>()
   for (const n of readActiveNotifications(ALL_NOTIFICATIONS)) if (!sources.has(n.packageName)) sources.set(n.packageName, n)
   const shown = Array.from(sources.values()).slice(0,Math.max(0,maxIcons))
-  return {icons: shown.map(notificationIcon),keys: shown.map(n => n.key),stale:false}
+  return {icons: shown.map(notificationIcon),keys: shown.map(n => n.key),packageNames: shown.map(n => n.packageName),stale:false}
 }
 export function readNotificationIconByKey(key: string, _allowStale: boolean) {
   const notification = readActiveNotifications(ALL_NOTIFICATIONS).find(n => n.key === key)

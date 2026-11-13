@@ -24,33 +24,182 @@ Button {
 
 
 Page.main-page {
-  background-color: #ffffff;
-  color: #222222;
+  background-color: #f4f3ee;
+  color: #1f211f;
+}
+.main-page .companion-tabs {
+  background-color: #f4f3ee;
+  tab-background-color: #fbfaf7;
+  tab-text-color: #72766f;
+  selected-tab-text-color: #285c45;
 }
 .main-page .main-header {
-  background-color: #424242;
-  color: #ffffff;
-  padding: 0 0 0 16;
-  height: 56;
+  background-color: #f4f3ee;
+  color: #1f211f;
+  padding: 10 12 6 16;
+  min-height: 58;
 }
-.main-page .action-bar-title { font-size: 18; font-weight: bold; color: #ffffff; }
-.main-page .action-bar-status { font-size: 14; color: #ffffff; margin-right: 12; }
+.main-page .action-bar-title { font-size: 32; font-weight: 700; color: #1f211f; vertical-align: center; }
+.main-page .compact-device-state { color: #285c45; font-size: 13; font-weight: 600; max-width: 250; margin: 0 8; }
 .main-page .action-bar-warning { font-size: 18; padding: 4 6; }
-/* Matches Android's 32x32 padded icon; the Image inside is 21x21. */
-.main-page .action-bar-app-icon { width: 32; height: 32; margin-right: 8; }
+.main-page .action-bar-app-icon { width: 44; height: 44; margin-right: 4; }
 .main-page .overflow-button {
   background-color: transparent;
-  color: #ffffff;
+  color: #285c45;
   font-size: 24;
   width: 44;
-  height: 48;
+  height: 44;
   margin: 0;
   padding: 0;
 }
-/* Match Android's button layout boxes, including the inset around each tile. */
-.main-page Button.tab-button { height: 48; margin-top: 6; margin-bottom: 6; }
-.main-page .mode-button { background-color: #e2e2e2; color: #333333; border-radius: 6; }
+.main-page .device-status-card {
+  background-color: #ffffff;
+  border-radius: 16;
+  margin: 2 16 12 16;
+  padding: 12 14;
+  min-height: 76;
+}
+.main-page .device-name { color: #1f211f; font-size: 17; font-weight: 600; }
+.main-page .device-connection-state { color: #285c45; font-size: 15; font-weight: 600; margin-left: 12; }
+.main-page .device-battery-summary { color: #696e68; font-size: 14; margin-top: 5; }
+.main-page .glasses-content { padding: 0 16 10 16; }
+.main-page .glasses-section { min-width: 0; }
+.main-page .section-eyebrow,
+.main-page .companion-section-title {
+  color: #73776f;
+  font-size: 12;
+  font-weight: 600;
+  letter-spacing: 0;
+  margin: 2 2 7 2;
+}
+.main-page .preview-section { margin-bottom: 12; }
+.main-page .glasses-preview { background-color: #111713; border-radius: 18; }
+.main-page .remote-section { min-height: 0; }
+.main-page .remote-controls { margin: 0; }
+.main-page .remote-mode-picker {
+  background-color: #e5e6e0;
+  border-radius: 11;
+  padding: 2;
+  margin-bottom: 10;
+}
+.main-page Button.tab-button {
+  min-height: 44;
+  margin: 0;
+  padding: 8 4;
+  border-radius: 9;
+  background-color: transparent;
+  color: #5f645e;
+  font-size: 14;
+}
+.main-page Button.tab-button-selected { background-color: #ffffff; color: #214d3a; }
+.main-page .remote-action-row { margin: 0 -4 10 -4; }
+.main-page .remote-action {
+  min-height: 48;
+  background-color: #ffffff;
+  border-radius: 13;
+  margin: 0 4;
+  padding: 0 14;
+}
+.main-page .remote-action-icon { width: 19; height: 19; tint-color: #285c45; margin-right: 9; }
+.main-page .remote-action-label { color: #1f211f; font-size: 16; font-weight: 600; }
+.main-page .remote-mode-content { min-height: 0; }
+.main-page .remote-display-settings { background-color: #ffffff; border-radius: 14; padding: 6 12; }
+.main-page .settings-row { min-height: 44; margin: 0; }
+.main-page .settings-row-label { color: #1f211f; font-size: 15; margin-right: 10; }
+.main-page .settings-battery-line { color: #696e68; font-size: 14; }
+.main-page .mode-button { background-color: #e8eee9; color: #285c45; border-radius: 9; min-height: 40; }
 .main-page .ble-bandwidth-indicator { color: #777777; font-size: 12; padding: 2 8; }
+
+.main-page .companion-scroll { background-color: #f4f3ee; }
+.main-page .companion-content { padding: 12 16 28 16; }
+.main-page .companion-heading { color: #1f211f; font-size: 32; font-weight: 700; margin: 0 0 18 0; }
+.main-page .companion-group { background-color: #ffffff; border-radius: 16; margin: 0 0 18 0; }
+.main-page .companion-row { min-height: 56; padding: 12 16; border-bottom-width: 1; border-bottom-color: #e7e8e2; }
+.main-page .companion-row-title { color: #1f211f; font-size: 16; font-weight: 500; }
+.main-page .companion-row-value { color: #6b7069; font-size: 15; text-align: right; }
+.main-page .companion-note { color: #6b7069; font-size: 14; margin: 2 2 14 2; }
+.main-page .companion-symbol { width: 24; height: 24; tint-color: #285c45; margin-right: 12; }
+.main-page .health-sync-button { background-color: #285c45; color: #ffffff; min-height: 50; margin: 10 12 8 12; font-size: 17; font-weight: 600; }
+.main-page .health-sync-button:disabled { background-color: #d9ddd8; color: #767b75; }
+
+.main-landscape .glasses-content { padding: 0 12 8 12; }
+.main-landscape .preview-section { margin: 0 12 0 0; }
+.main-landscape .remote-section { margin: 0; }
+
+.ns-dark Page.main-page,
+Page.main-page.ns-dark { background-color: #121512; color: #f2f2ed; }
+.ns-dark .main-page .companion-tabs {
+  background-color: #121512;
+  tab-background-color: #191d19;
+  tab-text-color: #9da39b;
+  selected-tab-text-color: #83c7a0;
+}
+.ns-dark .main-page .main-header,
+.ns-dark .main-page .companion-scroll { background-color: #121512; }
+.ns-dark .main-page .action-bar-title,
+.ns-dark .main-page .device-name,
+.ns-dark .main-page .remote-action-label,
+.ns-dark .main-page .settings-row-label,
+.ns-dark .main-page .companion-heading,
+.ns-dark .main-page .companion-row-title { color: #f2f2ed; }
+.ns-dark .main-page .action-bar-status,
+.ns-dark .main-page .compact-device-state,
+.ns-dark .main-page .device-connection-state,
+.ns-dark .main-page .overflow-button { color: #83c7a0; }
+.ns-dark .main-page .device-status-card,
+.ns-dark .main-page .remote-action,
+.ns-dark .main-page .remote-display-settings,
+.ns-dark .main-page .companion-group { background-color: #1d211d; }
+.ns-dark .main-page .device-battery-summary,
+.ns-dark .main-page .section-eyebrow,
+.ns-dark .main-page .companion-section-title,
+.ns-dark .main-page .settings-battery-line,
+.ns-dark .main-page .companion-row-value,
+.ns-dark .main-page .companion-note { color: #a9afa7; }
+.ns-dark .main-page .remote-mode-picker { background-color: #292e29; }
+.ns-dark .main-page Button.tab-button { color: #b2b7b0; }
+.ns-dark .main-page Button.tab-button-selected { background-color: #3a433c; color: #bce7ca; }
+.ns-dark .main-page .remote-action-icon,
+.ns-dark .main-page .companion-symbol { tint-color: #83c7a0; }
+.ns-dark .main-page .mode-button { background-color: #29362e; color: #a9daba; }
+.ns-dark .main-page .companion-row { border-bottom-color: #303530; }
+.ns-dark .main-page .health-sync-button { background-color: #3f815e; color: #ffffff; }
+.ns-dark .main-page .health-sync-button:disabled { background-color: #303530; color: #8f958e; }
+
+.notification-settings-page { background-color: #f4f3ee; color: #1f211f; }
+.notification-settings-note,
+.notification-settings-empty,
+.notification-detail-identity,
+.notification-toggle-description,
+.notification-detail-footnote { color: #696e68; }
+.notification-settings-note { padding: 12 16; }
+.notification-settings-empty { margin: 28 24; text-align: center; }
+.notification-source-row { min-height: 68; padding: 10 16; background-color: #ffffff; }
+.notification-source-name,
+.notification-toggle-title { color: #1f211f; font-size: 17; font-weight: 600; }
+.notification-source-summary { color: #696e68; font-size: 15; margin-top: 2; }
+.notification-source-package { color: #696e68; font-size: 13; margin-top: 2; }
+.notification-detail-content { padding: 16; }
+.notification-detail-identity { margin: 0 0 14 0; }
+.notification-global-note { color: #285c45; margin: 0 0 14 0; }
+.notification-toggle-row { min-height: 64; padding: 10 0; border-bottom-width: 1; border-bottom-color: #e1e3dd; }
+.notification-toggle-description { margin: 3 16 0 0; }
+.notification-detail-footnote { margin-top: 14; }
+.notification-toggle-row Switch { min-width: 44; min-height: 44; vertical-align: center; }
+
+.ns-dark .notification-settings-page { background-color: #121512; color: #f2f2ed; }
+.ns-dark .notification-settings-note,
+.ns-dark .notification-settings-empty,
+.ns-dark .notification-detail-identity,
+.ns-dark .notification-source-summary,
+.ns-dark .notification-source-package,
+.ns-dark .notification-toggle-description,
+.ns-dark .notification-detail-footnote { color: #a9afa7; }
+.ns-dark .notification-source-row { background-color: #1d211d; }
+.ns-dark .notification-source-name,
+.ns-dark .notification-toggle-title { color: #f2f2ed; }
+.ns-dark .notification-global-note { color: #83c7a0; }
+.ns-dark .notification-toggle-row { border-bottom-color: #303530; }
 
 .main-page .system-name-modal {
   background-color: #eeeeee;

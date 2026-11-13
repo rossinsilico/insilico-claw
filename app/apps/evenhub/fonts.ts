@@ -6,6 +6,7 @@
  */
 import { EvenHubFont } from "../../graphics/evenhub-font";
 import { getTerminusFont, TERMINUS_SIZES } from "../../graphics/bdffont";
+import { getDefaultSmallFont, getUiFontRevision } from "../../graphics/ui-fonts";
 import { TtfFont } from "../../graphics/ttf-font";
 import { listInstalledFonts } from "../../graphics/installed-fonts";
 import { wrapText } from "../../graphics/textwrap";
@@ -108,11 +109,11 @@ function openFace(choice: { face: FontFaceCandidate; size: number } | null): Eve
 }
 
 /**
- * The face a container draws with: the stock font when it names no font,
- * otherwise the closest match to its spec.
+ * The face a container draws with: the current global UI font when it names
+ * no font, otherwise the closest match to its explicit spec.
  */
 export function containerFace(spec: EvenHubFontSpec | undefined): EvenHubTextFace {
-  if (!spec) return EvenHubFont.get();
+  if (!spec) return new UiFontFace(getDefaultSmallFont());
   const key = `${spec.family ?? ""}|${spec.size ?? ""}|${spec.weight ?? ""}`;
   let face = resolved.get(key);
   if (face === undefined) {
@@ -130,10 +131,19 @@ export function availableFontFamilies(): FontFamilyInfo[] {
   return describeFontFamilies(listFaces());
 }
 
-/** Width of the widest line of `text` and the line height, in the font a container would use. */
-export function measureContainerText(text: string, spec: EvenHubFontSpec | undefined): { width: number; lineHeight: number } {
+/** Metrics and optional wrapping in exactly the face a container would draw. */
+export function measureContainerText(
+  text: string,
+  spec: EvenHubFontSpec | undefined,
+  maxWidth?: number,
+): { width: number; lineHeight: number; revision: number; lines?: string[] } {
   const face = containerFace(spec);
   let width = 0;
   for (const line of text.split("\n")) width = Math.max(width, face.measureLine(line));
-  return { width: Math.ceil(width), lineHeight: face.lineHeight };
+  return {
+    width: Math.ceil(width),
+    lineHeight: face.lineHeight,
+    revision: getUiFontRevision(),
+    ...(maxWidth === undefined ? {} : { lines: face.wrap(text, maxWidth) }),
+  };
 }

@@ -26,13 +26,16 @@ let glassesType = 'g2';
 function fixture() {
   const relay = { available: true, starts: 0, client: null, message: undefined };
   const observers = new Map(), phoneState = { protectedDataAvailable: true };
-  let settingsChanged, remoteHost, controller, bridge = null;
-  let now = 1000, nextTask = 0, screenOn = true, shellOptions;
+  let settingsChanged, remoteHost, controller, bridge = null, sharedBridge = null, connectionWanted = true, pullPending = false, detachShared;
+  let now = 1000, nextTask = 0, screenOn = true, shellOptions, wakeFocus;
+  const headUp = load('app/native/head-up-settings.ts', {});
   const battery = {};
+  const nativePolicy = { gate: null, calls: 0 };
+  const health = { enabled: false, drains: 0, pulls: 0, coldStart: false, ringMode: 'glasses', ring: '' };
   const tasks = new Map(), sent = [], previews = [], received = [], errors = [];
   const boardStats = { starts: 0, stops: 0, paints: 0 };
   const registered = [], inProcessApps = [];
-  const settings = { lock: true, enabled: true, tap: true, hold: true, tilt: true, duration: 3000, depth: 0 };
+  const settings = { lock: true, ringControlsOnlyWhileWorn: true, enabled: true, tap: true, hold: true, tilt: true, duration: 3000, depth: 0 };
   const clock = { Date: class extends Date { static now() { return now; } },
     setTimeout: (fn, ms) => { tasks.set(++nextTask, { fn, at: now + ms }); return nextTask; },
     clearTimeout: id => tasks.delete(id), setInterval: () => ++nextTask, clearInterval() {} };
@@ -49,7 +52,7 @@ function fixture() {
     requestRender() { void controller?.displayReady.then(() => controller.display?.submitSurfaceFrame('launcher', launcherPixels, fullRect, 'launcher')); }, setScreenOn() {} };
   const shell = {
     configure: options => { shellOptions = options; }, registerWindow: window => registered.push(window), focusWindow() {},
-    wake: () => { screenOn = true; shellOptions.onScreenStateChanged(true); },
+    wake: focus => { wakeFocus = focus; screenOn = true; shellOptions.onScreenStateChanged(true); },
     sleep: () => { screenOn = false; shellOptions.onScreenStateChanged(false); },
     isScreenOn: () => screenOn, getWindows: () => [window], foregroundWindow: () => window,
     setBatteryLevels: levels => Object.assign(battery, levels), underlayDim: () => 1, getFocus: () => 'app', hasOverlay: () => false,
@@ -57,7 +60,7 @@ function fixture() {
     paintScene: () => new Uint8Array([0, 0]), paintSurface: () => [{ image: new images.GrayImage(640, 480, 0), x: 0, y: 0 }],
     receiveInput: async input => {
       received.push(input);
-      if (input.type === 'display-wake' || !screenOn && input.type === 'double-click') shell.wake();
+      if (!screenOn && (input.type === 'display-wake' || input.type === 'double-click')) shell.wake();
     },
   };
   // Both display targets share a minimal compositor (z-ordered opaque and
@@ -107,9 +110,14 @@ function fixture() {
   const noop = () => () => {};
   class FaceclawCommunicatorBridge extends Display {
     phase = 'disconnected'; listeners = {};
-    constructor(addresses) { super(); bridge = this; this.addresses = addresses; }
+    headUpEnabled = true; headUpAtStart = null;
+    constructor(addresses) { super(); bridge = this; this.addresses = addresses; this.independent = addresses.independentRingHealth; }
     on(kind, fn) { this.listeners[kind] = fn; return () => { if (this.listeners[kind] === fn) delete this.listeners[kind]; }; }
     onStateChange(fn) { return this.on('state', fn); } onRingEvent(fn) { return this.on('ring', fn); }
+    onRingHealthPullFinished(fn) { return this.on('health', fn); }
+    isSessionReady() { return this.phase === 'connected'; }
+    canSyncRingHealth() { return this.isSessionReady() || Boolean(this.independent && this.addresses.ring); }
+    setIndependentRingHealthEnabled(enabled) { this.independent = enabled; }
     onWearState(fn) { return this.on('wear', fn); } onBatteryState(fn) { return this.on('battery', fn); } onCaseState(fn) { return this.on('case', fn); } onFirmwareInfo(fn) { return this.on('firmware', fn); }
     onFrameMetrics() { return noop(); } onPreviewAnimationFrame() { return noop(); } addCompassListener() { return noop(); } onAncsRelayFrame() { return noop(); }
     onAncsAuthorization() { return noop(); } setRequiresAncs() {} ancsRelayAvailable() { return relay.available; } rightWriteLimit() { return 20; } onPhoneLockSignal() {}
@@ -119,7 +127,12 @@ function fixture() {
     emitWear(wearing) { this.listeners.wear?.(wearing); }
     emitBattery(state) { this.listeners.battery?.(state); }
     emitCase(state) { this.listeners.case?.(state); }
-    async start() { this.emitState('connected', 'Connected.'); }
+    async setHeadUpEnabled(enabled) { nativePolicy.calls++; if (nativePolicy.gate) await nativePolicy.gate; this.headUpEnabled = enabled; }
+    async readHeadUpAngle() { return 30; }
+    async setHeadUpAngle() { return true; }
+    async start() { this.headUpAtStart = this.headUpEnabled; this.emitState(health.coldStart ? 'connecting' : 'connected', health.coldStart ? 'Glasses unavailable' : 'Connected.'); }
+    async promoteToInteractive() { await this.start(); }
+    get connectionState() { return {phase:this.phase,status:this.phase}; }
     async disconnect() { this.emitState('disconnected', 'Disconnected.'); }
     waitForFrameFinished() { return Promise.resolve('sent'); }
     changed() { if (this.phase === 'connected') sent.push(this.getCompositePreview()); }
@@ -127,12 +140,35 @@ function fixture() {
   const provider = {
     isEnabled: () => settings.enabled, showOnTap: () => settings.tap,
     showOnLongPress: () => settings.hold, showOnHeadTilt: () => settings.tilt,
+    headUpTarget: () => settings.target ?? (settings.enabled ? 'glanceboard' : 'last-app'),
     tapTimeoutMs: () => settings.duration, depth: () => settings.depth,
     createBoard: () => ({ start: () => boardStats.starts++, stop: () => boardStats.stops++,
       paint: () => { boardStats.paints++; return new images.GrayImage(100, 80, 200); } }),
   };
   const inputMonitor = load("app/ui/input-monitor.ts", {});
   const modules = {
+    '../health/ring-session.ios': {
+      async ensureIosSession(options) {
+        if(options.userInitiated)connectionWanted=true;
+        if(!connectionWanted)return null;
+        if(!sharedBridge) {
+          sharedBridge=new FaceclawCommunicatorBridge({right:'AA',left:'BB',ring:health.ringMode==='direct'?health.ring:'',
+            ringRole:health.ringMode==='direct'&&health.ring?'glasses':undefined,glassesType,
+            independentRingHealth:health.ringMode==='direct'&&Boolean(health.ring)&&health.enabled});
+          const target=sharedBridge;
+          target.onRingHealthPullFinished(()=>{if(sharedBridge===target){health.drains++;pullPending=false;}});
+        }
+        return sharedBridge;
+      },
+      claimIosSessionForUi(_bridge,detach){detachShared=detach;},
+      async releaseIosSession(target){if(sharedBridge===target)sharedBridge=null;await target.close();},
+      setIosSessionConnectionWanted(value){connectionWanted=value;},
+      syncIosRingPolicy(){sharedBridge?.setIndependentRingHealthEnabled(health.enabled);if(!health.enabled)pullPending=false;},
+      resumeIosRingHealth(){if(health.enabled&&sharedBridge?.addresses.ring&&sharedBridge.canSyncRingHealth()&&!pullPending){pullPending=true;health.pulls++;}},
+    },
+    '../health/healthkit-sync.ios': { isAutomaticR1HealthSyncEnabled: () => health.enabled,
+      syncAutomaticR1Health: async () => { health.drains++; } },
+    '../health/health-live': { requestFreshPull: () => { health.pulls++; } },
     "../ui/input-monitor": inputMonitor,
     '../remote/service': { startRemoteInput(host) { remoteHost = host; } },
     '../assistant/system-tools': { registerSystemTools() {} },
@@ -144,6 +180,7 @@ function fixture() {
     '../native/notification-sources': { shouldShowNotificationOnGlasses: () => true },
     "../native/compass.ios": { bindCompassSession() {}, receiveCompassEvent() {} },
     '../native/bandwidth-benchmark.ios': { bindBandwidthBenchmarkSession() {} },
+    '../native/head-up-settings': headUp,
     '@nativescript/core': { File: { fromPath: () => ({ writeTextSync() {} }) },
       knownFolders: { documents: () => ({ path: '/tmp' }) }, path },
     '../native/ios-voice-input': { iosVoiceInput: { handleSessionEnded() {}, stopPhoneCapture() {}, setRawSession() {}, onSpeechEnd: () => () => {} } },
@@ -162,7 +199,7 @@ function fixture() {
     './phone-preview-crop': { phonePreviewCrop: () => null, mirrorToPanelFraction: (_crop, nx, ny) => ({ nx, ny }) },
     './lock-screen': { LOCK_SCREEN_SURFACE_ID: 'lock-screen', createLockScreenImage: () => new images.GrayImage(640, 480, 123) },
     './glasses-presence': load('app/g2/glasses-presence.ts', {}),
-    './device-addresses': { loadDeviceAddresses: () => ({ right: 'AA', left: 'BB', ring: '' }) }, './ios-peripheral-identity': { deviceAddressError: () => null },
+    './device-addresses': { loadDeviceAddresses: () => ({ right: 'AA', left: 'BB', ring: health.ring }) }, './ios-peripheral-identity': { deviceAddressError: () => null },
     './wear-remote': { WearRemote: class { schedulePublish() {} } },
     './firmware-compat': load('app/g2/firmware-compat.ts', {}), './reconnect-policy': load('app/g2/reconnect-policy.ts', {}),
     '../apps/launcher': { launcherEntries: () => [] },
@@ -178,7 +215,7 @@ function fixture() {
     '../apps/all-apps': { ALL_APPS: [{ appId: 'glanceboard', glanceboard: provider }] },
     '../apps/onboarding/onboarding-progress': { claimGlassesOnboardingAutoLaunch: () => false },
     '../ui/shell/worker-window': {}, '../ui/shell/in-process-window': {},
-    '../ui/dashboard-settings': { glassesTypeSetting: { get: () => glassesType }, brightnessSetting: { get: () => 'auto' }, brightnessSettingToLevel: () => null, getBrightnessPreferences: () => ({ auto: true, level: 50, minimum: 2, maximum: 100, curve: '0:0,1000:100', fadeMs: 280 }), lockScreenEnabledSetting: { get: () => settings.lock }, ringConnectionModeSetting: { get: () => 'glasses' }, onAnySettingChanged: fn => { settingsChanged = fn; return () => {}; }, previewColorSetting: { get: () => 'white' } },
+    '../ui/dashboard-settings': { glassesTypeSetting: { get: () => glassesType }, brightnessSetting: { get: () => 'auto' }, brightnessSettingToLevel: () => null, getBrightnessPreferences: () => ({ auto: true, level: 50, minimum: 2, maximum: 100, curve: '0:0,1000:100', fadeMs: 280 }), lockScreenEnabledSetting: { get: () => settings.lock }, ringConnectionModeSetting: { get: () => health.ringMode }, ringControlsOnlyWhileWornSetting: { get: () => settings.ringControlsOnlyWhileWorn }, onAnySettingChanged: fn => { settingsChanged = fn; return () => {}; }, previewColorSetting: { get: () => 'white' } },
     '../native/phone-battery': { readPhoneBatteryState: () => ({ battery: 80, charging: false }) },
     '../apps/ios-availability': { iosAppUnavailableReason: () => null },
     '../graphics/glyph-wire': { prepareFrameDraws: () => null },
@@ -219,11 +256,62 @@ function fixture() {
     await render();
   }
   async function phone(type, origin = 'ring') { controller.gesture(type, origin); await render(); }
-  async function connect() { await controller.connect(); await render(); }
-  return { relay, controller, shell, battery, remoteHost, keyboardChanged: session => shellOptions.onKeyboardInputChanged(session), settings, phoneState, observers,
+  async function connect() { await controller.connect(false,true); await render(); }
+  return { relay, controller, shell, battery, nativePolicy, headUp, get wakeFocus() { return wakeFocus; }, health, remoteHost, keyboardChanged: session => shellOptions.onKeyboardInputChanged(session), settings, phoneState, observers,
     get shellOptions() { return shellOptions; }, registered, inProcessApps,
-    get bridge() { return bridge; }, connect, wear: wearing => bridge.emitWear(wearing), settingsChanged: () => settingsChanged(), sent, previews, received, boardStats, hardware, phone, advance, render };
+    get bridge() { return bridge; }, detachShared:()=>detachShared(), connect, wear: wearing => bridge.emitWear(wearing), settingsChanged: () => settingsChanged(), sent, previews, received, boardStats, hardware, phone, advance, render };
 }
+test('R1 collection needs automatic consent and stale transfer callbacks cannot target a replacement session', async () => {
+  const f = fixture();
+  Object.assign(f.health,{ringMode:'direct',ring:'R1'});
+  await f.connect();
+  assert.equal(f.health.pulls, 0);
+  f.health.enabled = true;
+  f.controller.pause(); f.controller.resume();
+  await f.render();
+  assert.equal(f.health.pulls, 1);
+  const oldCompletion = f.bridge.listeners.health;
+  const before = f.health.drains;
+  oldCompletion({ completed: false, pages: 1, watermark: 1 });
+  assert.equal(f.health.drains, before + 1);
+  assert.equal(f.health.pulls, 1);
+  await f.controller.disconnect();
+  const closed = f.health.drains;
+  oldCompletion({ completed: true, pages: 1, watermark: 2 });
+  assert.equal(f.health.drains, closed);
+});
+
+test('cased startup queues Direct-mode health after native start and revoking consent keeps controls gated', async () => {
+  const f = fixture();
+  Object.assign(f.health, { enabled: true, coldStart: true, ringMode: 'direct', ring: 'R1' });
+  await f.connect();
+  assert.equal(f.bridge.addresses.independentRingHealth, true);
+  assert.equal(f.bridge.isSessionReady(), false);
+  assert.equal(f.health.pulls, 1);
+  const before = f.received.length;
+  await f.hardware(0);
+  assert.equal(f.received.length, before);
+  f.health.enabled = false; f.settingsChanged();
+  assert.equal(f.bridge.independent, false);
+  f.controller.pause(); f.controller.resume(); await f.render();
+  assert.equal(f.health.pulls, 1);
+});
+
+test('ordinary ready startup never invents a ring in glasses-only mode', async () => {
+  const f = fixture(); f.health.enabled = true;
+  await f.connect();
+  assert.equal(f.bridge.addresses.ring, '');
+  assert.equal(f.bridge.addresses.independentRingHealth, false);
+  assert.equal(f.health.pulls, 0);
+});
+
+test('service-driven detach resets the connected UI and returns to preview without an explicit user stop',async()=>{
+  const f=fixture();await f.connect();assert.equal(f.controller.connectionState.phase,'connected');
+  f.detachShared();await f.render();
+  assert.equal(f.controller.connectionState.phase,'disconnected');
+  assert.equal(f.controller.communicator,null);assert.ok(f.previews.length>0);
+});
+
 test('the session is told which glasses it drives, as a G2 session gets nowhere on a G1', async () => {
   for (const type of ['g1', 'g2']) {
     glassesType = type;
@@ -260,6 +348,90 @@ const assertBoard = pixels => {
   assert.equal(pixels[48 * 640 + 270], 200);
   assert.equal(pixels[0], 0, 'opaque Glanceboard hides the retained app and shell');
 };
+
+test('head-up Off keeps both Glanceboard and the regular display asleep, including while locked', async () => {
+  for (const enabled of [true, false]) for (const locked of [false, true]) {
+    const f = fixture();
+    await f.connect();
+    Object.assign(f.settings, { enabled, tilt: false });
+    f.controller.glassesLocked = locked;
+    f.shell.sleep();
+    const before = f.received.length;
+    await f.hardware(12, 0);
+    assert.equal(f.controller.glance.isVisible(), false);
+    assert.equal(f.shell.isScreenOn(), false, `board=${enabled}, locked=${locked}`);
+    assert.equal(f.received.length, before, 'head-up must not reach the regular wake path');
+    await f.hardware(3, 0);
+    assert.equal(f.shell.isScreenOn(), true, 'double-tap still wakes');
+  }
+});
+
+test('native head-up policy is applied before interactive startup and updated live', async () => {
+  const f = fixture();
+  f.settings.tilt = false;
+  await f.connect();
+  assert.equal(f.bridge.headUpAtStart, false);
+  f.settings.tilt = true;
+  f.settingsChanged();
+  await f.render();
+  assert.equal(f.bridge.headUpEnabled, true);
+});
+
+test('a setting changed while initial native policy waits is not lost during connect', async () => {
+  const f = fixture();
+  let release;
+  f.nativePolicy.gate = new Promise(resolve => { release = resolve; });
+  f.settings.tilt = false;
+  const connected = f.connect();
+  while (!f.nativePolicy.calls) await new Promise(resolve => setImmediate(resolve));
+  f.settings.tilt = true;
+  f.settingsChanged();
+  release();
+  await connected;
+  assert.equal(f.bridge.headUpEnabled, true);
+  assert.equal(f.bridge.headUpAtStart, true);
+});
+
+test('head-up On uses Glanceboard when enabled and regular wake otherwise, without reconnecting', async () => {
+  for (const enabled of [true, false]) {
+    const f = fixture();
+    await f.connect();
+    Object.assign(f.settings, { enabled, tilt: false });
+    f.shell.sleep();
+    await f.hardware(12, 0);
+    assert.equal(f.shell.isScreenOn(), false);
+    f.settings.tilt = true;
+    await f.hardware(12, 0);
+    assert.equal(f.controller.glance.isVisible(), enabled);
+    assert.equal(f.shell.isScreenOn(), !enabled);
+  }
+});
+
+test('head-up Show opens Glanceboard independently of tap/hold enable, or the retained app', async () => {
+  const f = fixture();
+  await f.connect();
+  Object.assign(f.settings, { enabled: false, target: 'glanceboard' });
+  f.shell.sleep(); await f.hardware(12, 0);
+  assert.equal(f.controller.glance.isVisible(), true);
+  assert.equal(f.shell.isScreenOn(), false);
+  f.controller.glance.dismiss(); await f.render();
+  f.settings.target = 'last-app';
+  await f.hardware(12, 0);
+  assert.equal(f.controller.glance.isVisible(), false);
+  assert.equal(f.shell.isScreenOn(), true);
+  assert.equal(f.wakeFocus, 'window');
+});
+
+test('angle editor binding expires a picker across the same native session reconnect', async () => {
+  const f = fixture();
+  await f.connect();
+  assert.equal(f.headUp.isHeadUpSettingsAvailable(), true);
+  const generation = f.headUp.headUpSettingsGeneration();
+  f.bridge.emitState('retrying');
+  assert.equal(f.headUp.isHeadUpSettingsAvailable(), false);
+  f.bridge.emitState('connected');
+  await assert.rejects(f.headUp.setHeadUpAngle(30, generation), /connection changed/);
+});
 
 test('phone preview gestures use Glanceboard; losing runtime cleans up holds and timers', async () => {
   const f = fixture(); f.shell.sleep();
@@ -307,11 +479,100 @@ test('ring battery reported through the glasses reaches the shell while connecte
   assert.deepEqual([f.battery.ring, f.battery.ringCharging], [null, null]);
 });
 
+test('ring gestures fail closed until wear is confirmed, without gating temple input', async () => {
+  const f = fixture();
+  await f.connect();
+  await f.hardware(0, 2);
+  assert.equal(f.received.length, 0, 'unknown wear state blocks ring input');
+  await f.hardware(0, 1);
+  assert.equal(f.received.length, 1, 'temple input is unchanged');
+  f.wear(true);
+  await f.hardware(0, 2);
+  assert.equal(f.received.length, 2, 'confirmed worn allows ring input');
+  f.wear(false);
+  await f.hardware(0, 2);
+  assert.equal(f.received.length, 2, 'off-head blocks ring input');
+  f.wear(true);
+  f.bridge.emitState('retrying', 'Reconnecting');
+  f.bridge.emitState('connected', 'Connected');
+  await f.hardware(0, 2);
+  assert.equal(f.received.length, 2, 'a reconnected transport requires a fresh worn report');
+});
+
+test('a ring gesture arriving before worn confirmation stays blocked if its queue runs later', async () => {
+  const f = fixture();
+  await f.connect();
+  let unblock;
+  f.controller.inputQueue = new Promise(resolve => { unblock = resolve; });
+  f.bridge.emitRing({ kind: 'sys-event', containerName: '', eventType: 0, eventSource: 2,
+    systemExitReasonCode: 0, frameId: 0 });
+  f.wear(true);
+  unblock();
+  await f.render();
+  assert.equal(f.received.length, 0);
+});
+
+test('a queued hold release cannot revive across an off-head then on-head transition', async () => {
+  const f = fixture();
+  await f.connect();
+  f.wear(true);
+  await f.hardware(9, 2);
+  let unblock;
+  f.controller.inputQueue = new Promise(resolve => { unblock = resolve; });
+  f.bridge.emitRing({ kind: 'sys-event', containerName: '', eventType: 10, eventSource: 2,
+    systemExitReasonCode: 0, frameId: 0 });
+  f.wear(false);
+  f.wear(true);
+  unblock();
+  await f.render();
+  assert.deepEqual(f.received.map(event => event.type), ['long-press']);
+  assert.equal(f.shell.isScreenOn(), false);
+});
+
+test('turning off the wear gate allows ring gestures while off-head', async () => {
+  const f = fixture();
+  f.settings.ringControlsOnlyWhileWorn = false;
+  await f.connect();
+  f.wear(false);
+  await f.hardware(0, 2);
+  assert.equal(f.received.length, 1);
+});
+
+test('taking the glasses off cancels an admitted ring hold without dispatching its release', async () => {
+  const f = fixture();
+  await f.connect();
+  f.wear(true);
+  await f.hardware(9, 2);
+  assert.deepEqual(f.received.map(event => event.type), ['long-press']);
+  f.wear(false);
+  await f.render();
+  assert.equal(f.shell.isScreenOn(), false, 'sleep cancels voice, overlays and hold timers without submitting a release');
+  await f.hardware(10, 2);
+  assert.deepEqual(f.received.map(event => event.type), ['long-press']);
+});
+
+test('enabling the wear gate while off-head cancels a ring hold admitted by the override', async () => {
+  const f = fixture();
+  f.settings.ringControlsOnlyWhileWorn = false;
+  await f.connect();
+  f.wear(false);
+  await f.hardware(9, 2);
+  f.settings.ringControlsOnlyWhileWorn = true;
+  f.settingsChanged();
+  await f.render();
+  assert.equal(f.shell.isScreenOn(), false);
+  await f.hardware(10, 2);
+  assert.deepEqual(f.received.map(event => event.type), ['long-press']);
+});
+
 test('the charging case reading reaches the shell and keeps its level once the glasses leave the case', async () => {
   const f = fixture();
   await f.connect();
+  f.wear(true);
   f.bridge.emitCase({ battery: 64, charging: true, docked: true });
   assert.deepEqual([f.battery.case, f.battery.caseCharging], [64, true]);
+  await f.hardware(0, 2);
+  assert.equal(f.received.length, 0, 'a docked case report invalidates a stale worn state');
   // Out of the case there is no level, and whether the case is on USB is unknown.
   f.bridge.emitCase({ battery: null, charging: false, docked: false });
   assert.deepEqual([f.battery.case, f.battery.caseCharging], [64, null]);

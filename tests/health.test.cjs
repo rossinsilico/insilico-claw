@@ -68,6 +68,20 @@ function sample(metric, startMs, min, max, avg, total) {
   return { metric, startMs, spanMs: HOUR, min, max, avg, total: total ?? avg };
 }
 
+function liveSample(metric, startMs, min, max, avg, ringId = "AA:BB:CC:DD:EE:FF", receivedAtMs = startMs + HOUR) {
+  return {
+    ...sample(metric, startMs, min, max, avg),
+    provenance: { kind: "r1-live", ringId, receivedAtMs, dateSource: "ring-anchor" },
+  };
+}
+
+function liveReading(metric, atMs, value, ringId = "AA:BB:CC:DD:EE:FF", receivedAtMs = atMs) {
+  return {
+    metric, startMs: atMs, spanMs: 0, min: value, max: value, avg: value, total: value,
+    provenance: { kind: "r1-live", ringId, receivedAtMs, dateSource: "ring-latest" },
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Storage
 
@@ -114,6 +128,97 @@ test("re-storing an unchanged bucket writes nothing; a changed one corrects it",
   const held = reloaded.samplesInRange(start, start + DAY_MS);
   assert.equal(held.length, 1);
   assert.equal(held[0].max, 104);
+});
+
+test("fresh R1 provenance persists and revisions change only with export-significant state", () => {
+  const backend = memoryBackend();
+  const store = new HealthStore(backend);
+  const start = Date.UTC(2026, 10, 10, 12);
+
+  assert.equal(store.ingestSamples([liveSample("heartRate", start, 55, 90, 70,
+    "AA:BB:CC:DD:EE:FF", start + HOUR / 2)]), 1);
+  let held = new HealthStore(backend).samplesInRange(start, start + HOUR)[0];
+  assert.deepEqual(held.provenance, {
+    kind: "r1-live", ringId: "AA:BB:CC:DD:EE:FF", receivedAtMs: start + HOUR / 2,
+    dateSource: "ring-anchor", exportRevision: 1,
+  });
+
+  assert.equal(store.ingestSamples([liveSample("heartRate", start, 55, 90, 70,
+    "AA:BB:CC:DD:EE:FF", start + 3 * HOUR / 4)]), 0, "incomplete receipt churn does not append");
+  assert.equal(store.ingestSamples([liveSample("heartRate", start, 55, 90, 70,
+    "AA:BB:CC:DD:EE:FF", start + HOUR)]), 1, "completion is export-significant");
+  assert.equal(store.ingestSamples([liveSample("heartRate", start, 55, 90, 70,
+    "AA:BB:CC:DD:EE:FF", start + 2 * HOUR)]), 0, "later complete receipts do not append");
+  assert.equal(store.ingestSamples([liveSample("heartRate", start, 55, 96, 74,
+    "AA:BB:CC:DD:EE:FF", start + 2 * HOUR)]), 1);
+  held = new HealthStore(backend).samplesInRange(start, start + HOUR)[0];
+  assert.equal(held.provenance.exportRevision, 3);
+  assert.equal(held.provenance.receivedAtMs, start + 2 * HOUR);
+
+  assert.equal(store.ingestSamples([liveSample("heartRate", start, 55, 96, 74,
+    "11:22:33:44:55:66", start + 2 * HOUR)]), 0, "another ring cannot erase the first ring's revision history");
+  held = new HealthStore(backend).samplesInRange(start, start + HOUR)[0];
+  assert.equal(held.provenance.ringId, "AA:BB:CC:DD:EE:FF");
+  assert.equal(held.provenance.exportRevision, 3);
+  assert.equal(store.ingestSamples([sample("heartRate", start, 55, 90, 70), sample("heartRate", start, 55, 96, 74)]), 0,
+    "unknown journal replay cannot downgrade verified data");
+  const restarted = new HealthStore(backend);
+  restarted.ingestSamples([liveSample("heartRate", start, 55, 98, 76, "AA:BB:CC:DD:EE:FF", start + 3 * HOUR)]);
+  assert.equal(restarted.samplesInRange(start, start + HOUR)[0].provenance.exportRevision, 4);
+});
+
+test("only a fresh native-origin sample upgrades a legacy bucket", () => {
+  const backend = memoryBackend();
+  const store = new HealthStore(backend);
+  const start = Date.UTC(2026, 10, 10, 12);
+  const legacy = sample("spo2", start, 95, 99, 97);
+  store.ingestSamples([legacy]);
+  assert.equal(store.ingestSamples([legacy]), 0);
+  assert.equal(store.samplesInRange(start, start + HOUR)[0].provenance, undefined);
+
+  assert.equal(store.ingestSamples([liveSample("spo2", start, 95, 99, 97)]), 1);
+  assert.equal(new HealthStore(backend).samplesInRange(start, start + HOUR)[0].provenance.exportRevision, 1);
+});
+
+test("instant readings persist across restart without entering aggregate samples or rollups", () => {
+  const backend = memoryBackend();
+  const store = new HealthStore(backend);
+  const hour = Date.UTC(2026, 10, 11, 12);
+  const at = hour + 17 * 60_000;
+  store.ingestSamples([
+    liveSample("heartRate", hour, 55, 90, 70),
+    liveReading("heartRate", at, 74),
+  ]);
+
+  assert.equal(store.samplesInRange(hour, hour + HOUR).length, 1);
+  assert.equal(store.readingsInRange(hour, hour + HOUR).length, 1);
+  assert.equal(store.readingsInRange(at, at + 1)[0].avg, 74);
+  assert.equal(store.readingsInRange(hour, at).length, 0, "end boundary must be exclusive");
+  assert.equal(store.readingsInRange(at + 1, hour + HOUR).length, 0);
+
+  const restarted = new HealthStore(backend);
+  assert.equal(restarted.readingsInRange(hour, hour + HOUR)[0].provenance.dateSource, "ring-latest");
+  const rollup = restarted.dailyRollups("heartRate", hour, hour + DAY_MS).values().next().value;
+  assert.equal(rollup.count, 1, "instant reading changed aggregate rollups");
+  assert.equal(rollup.avg, 70);
+});
+
+test("instant reading at an aggregate boundary does not collide and conflicting repeats keep the first value", () => {
+  const backend = memoryBackend();
+  const store = new HealthStore(backend);
+  const hour = Date.UTC(2026, 10, 11, 12);
+  assert.equal(store.ingestSamples([
+    liveSample("spo2", hour, 96, 99, 98),
+    liveReading("spo2", hour, 97),
+  ]), 2);
+  const sampleFile = () => backend.files.get([...backend.files.keys()].find((key) => key.startsWith("samples-")));
+  const afterFirst = sampleFile();
+
+  assert.equal(store.ingestSamples([liveReading("spo2", hour, 97, "AA:BB:CC:DD:EE:FF", hour + 1000)]), 0);
+  assert.equal(store.ingestSamples([liveReading("spo2", hour, 96, "AA:BB:CC:DD:EE:FF", hour + 2000)]), 0);
+  assert.equal(sampleFile(), afterFirst, "repeated or conflicting point grew the sample shard");
+  assert.equal(store.samplesInRange(hour, hour + HOUR)[0].avg, 98);
+  assert.equal(store.readingsInRange(hour, hour + HOUR)[0].avg, 97, "conflict overwrote the first point");
 });
 
 test("a corrupt rollup cache is rebuilt from the shards rather than trusted", () => {
@@ -168,6 +273,8 @@ test("failed sample corrections stay retryable, including a partially stored bat
   const reloaded = new HealthStore(backend);
   assert.equal(reloaded.samplesInRange(first, second + DAY_MS).length, 2);
   assert.equal(reloaded.samplesInRange(second, second + DAY_MS)[0].avg, 80);
+  assert.equal(reloaded.dailyRollups("heartRate", first, first + DAY_MS).get(first).avg, 70,
+    "the already-appended shard must also refresh its rollup after retry");
 });
 
 test("failed sleep appends and corrections do not poison deduplication", () => {
@@ -243,6 +350,24 @@ test("an anchored hourly page dates each group from the anchor", () => {
   assert.equal(result.samples[1].startMs, anchor + 5 * HOUR_MS);
 });
 
+test("hourly ingest carries live R1 origin to every anchored group", () => {
+  const anchor = Date.UTC(2026, 10, 10, 12);
+  const provenance = {
+    kind: "r1-live", ringId: "AA:BB:CC:DD:EE:FF", receivedAtMs: anchor + 2 * HOUR,
+    dateSource: "ring-anchor",
+  };
+  const result = convertRecords([{
+    kind: "hourly", metric: "heartRate", anchorMs: anchor, provenance,
+    groups: [
+      { hourIndex: 0, avg: 70, max: 90, min: 55 },
+      { hourIndex: 1, avg: 72, max: 92, min: 56 },
+    ],
+  }]);
+  assert.equal(result.samples.length, 2);
+  assert.deepEqual(result.samples[0].provenance, provenance);
+  assert.deepEqual(result.samples[1].provenance, provenance);
+});
+
 // The index is cracked (2026-09-12): bucket i starts at anchor + i * 10 minutes.
 // This test previously asserted the opposite - one day-span total, buckets
 // deliberately discarded - which was the honest call while the index was only
@@ -279,8 +404,31 @@ test("steps place each bucket at anchor + index * ten minutes", () => {
   assert.equal(calories[1].startMs, anchor + 130 * TEN_MINUTES_MS);
   assert.equal(calories[1].total, 21);
 
+  const activeCalories = result.samples.filter((entry) => entry.metric === "activeCalories");
+  assert.equal(activeCalories.length, 2);
+  assert.equal(activeCalories[1].startMs, anchor + 130 * TEN_MINUTES_MS);
+  assert.equal(activeCalories[1].total, 9, "active calories must remain distinct from total calories");
+
   // Nothing is declined any more - the buckets are placed, not discarded.
   assert.equal(result.skipped.length, 0);
+});
+
+test("activity buckets carry fresh ring provenance on all three streams", () => {
+  const anchor = Date.UTC(2026, 10, 11, 5);
+  const provenance = {
+    kind: "r1-live", ringId: "AA:BB:CC:DD:EE:FF", receivedAtMs: anchor + HOUR,
+    dateSource: "ring-anchor",
+  };
+  const result = convertRecords([{
+    kind: "steps", anchorMs: anchor, provenance,
+    buckets: [{ index: 2, steps: 321, activeCalories: 7, totalCalories: 19 }],
+  }]);
+  assert.deepEqual(result.samples.map(({ metric, total, provenance: origin }) =>
+    [metric, total, origin?.dateSource]), [
+    ["steps", 321, "ring-anchor"],
+    ["activeCalories", 7, "ring-anchor"],
+    ["calories", 19, "ring-anchor"],
+  ]);
 });
 
 test("a sleep session is stored with its time marked unresolved", () => {
@@ -352,6 +500,50 @@ test("a clock correction promotes a sleep session to a real placement", () => {
   // The correction must move where the night sits, never how long it was.
   assert.equal(night.endMs - night.startMs, 11070 * 1000);
   assert.equal(night.totalSec, 10440);
+});
+
+test("verified sleep preserves raw temperature timezone and fresh provenance", () => {
+  const startTs = Math.floor(Date.UTC(2026, 10, 10, 23) / 1000);
+  const provenance = {
+    kind: "r1-live", ringId: "AA:BB:CC:DD:EE:FF", receivedAtMs: (startTs + 3600) * 1000,
+    dateSource: "ring-sleep",
+  };
+  const result = convertRecords([{
+    kind: "sleep", startTs, endTs: startTs + 3600,
+    totalSec: 3000, wakeSec: 600, remSec: 600, lightSec: 1800, deepSec: 600,
+    segments: [
+      { stageId: 0, halfMinutes: 20 }, { stageId: 1, halfMinutes: 20 },
+      { stageId: 2, halfMinutes: 60 }, { stageId: 3, halfMinutes: 20 },
+    ],
+    receivedAtMs: provenance.receivedAtMs, clockCorrectionMs: 0,
+    temperatureRaw: 312, utcOffsetMinutes: -300, provenance,
+  }]);
+  assert.equal(result.sleep.length, 1);
+  assert.equal(result.sleep[0].temperatureRaw, 312);
+  assert.equal(result.sleep[0].utcOffsetMinutes, -300);
+  assert.equal(result.sleep[0].provenance.dateSource, "ring-sleep");
+});
+
+test("verified sleep revisions are stable and unknown replay cannot replace it", () => {
+  const backend = memoryBackend();
+  const store = new HealthStore(backend);
+  const startMs = Date.UTC(2026, 10, 10, 23);
+  const base = {
+    dayStartMs: startOfLocalDay(startMs + HOUR), startMs, endMs: startMs + HOUR,
+    totalSec: 3000, wakeSec: 600, remSec: 600, lightSec: 1800, deepSec: 600,
+    segments: [{ stageId: 0, halfMinutes: 20 }, { stageId: 2, halfMinutes: 100 }],
+    timeResolved: true, temperatureRaw: null, utcOffsetMinutes: -300,
+  };
+  const origin = {
+    kind: "r1-live", ringId: "AA:BB:CC:DD:EE:FF", receivedAtMs: startMs + HOUR,
+    dateSource: "ring-sleep",
+  };
+  assert.equal(store.ingestSleep([{ ...base, provenance: origin }]), 1);
+  assert.equal(store.ingestSleep([{ ...base, provenance: { ...origin, receivedAtMs: startMs + HOUR + 1000 } }]), 0);
+  assert.equal(store.sleepSessions()[0].provenance.exportRevision, 1);
+  assert.equal(store.ingestSleep([{ ...base, wakeSec: 900, provenance: undefined }]), 0);
+  assert.equal(store.sleepSessions()[0].wakeSec, 600);
+  assert.equal(new HealthStore(backend).sleepSessions()[0].provenance.exportRevision, 1);
 });
 
 test("the real 2026-09-12 record decodes to the window Chris confirmed", (t) => {

@@ -4,3 +4,5 @@
 * text=auto eol=lf
 *.bat text eol=crlf
 *.cmd text eol=crlf
+# Blank context lines in portable source patches intentionally contain a space.
+vendor-patches/*.patch whitespace=-blank-at-eol

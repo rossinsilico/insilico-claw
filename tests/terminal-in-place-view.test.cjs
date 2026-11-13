@@ -333,6 +333,17 @@ test('a session in its own window keeps its plain menu and double-tap yields foc
   assert.deepEqual(t.repliesOf('yield-focus').map((reply) => reply.windowId), [windowId]);
 });
 
+test('a session menu sends terminal Up and Down escape bytes without changing scroll gestures', async () => {
+  const t = hubShowingSession();
+  t.openMenu();
+  const menu = t.menus.find((candidate) => candidate.isOpen());
+  assert.deepEqual(t.menuLabels().slice(-4), ['Send <Enter>', 'Send <Esc>', 'Send <Up>', 'Send <Down>']);
+  const stack = { pop: () => {}, push() {} };
+  await menu.opened.find((item) => item.label === 'Send <Up>').onSelect({ stack });
+  await menu.opened.find((item) => item.label === 'Send <Down>').onSelect({ stack });
+  assert.deepEqual(t.clients[1].sent, ['\u001b[A', '\u001b[B']);
+});
+
 test('a bell still finds the window while the hub is showing a session', () => {
   const t = hubShowingSession();
   // A session with no view of its own wakes to the hub's window.

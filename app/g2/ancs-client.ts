@@ -3,6 +3,7 @@ import type { AndroidNotification } from '../native/notification-types'
 export const ANCS_FIRMWARE_VERSION = 16
 export const ANCS_CONNECT_MESSAGE = 'Connect glasses to receive iPhone notifications.'
 const MAX_ACTIVE = 128
+const MAX_HIDDEN = 4096
 const MAX_RESPONSE = 2048
 const MAX_COMMAND = 80 // Firmware relay limit, including its 8-byte header.
 const HEADER = 11
@@ -32,6 +33,9 @@ function utf8(bytes: Uint8Array): string {
 function fallbackAppName(identifier: string): string {
   return identifier.split('.').filter(Boolean).pop() || 'Unknown app'
 }
+function suppressesPopup(flags: number, identifier?: string): boolean {
+  return Boolean(flags & 5) || identifier !== undefined && (!identifier.trim() || /[\x00-\x1f\x7f]/.test(identifier))
+}
 function notificationDate(value: string): number | undefined {
   const parts = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})$/.exec(value)
   if (!parts) return undefined
@@ -58,6 +62,7 @@ export class AncsClient {
   private response: number[] = []
   private sources = new Map<number, Source>()
   private notifications = new Map<number, AndroidNotification>()
+  private hiddenUids = new Set<number>()
   private appNames = new Map<string, string>()
   private maxWrite = 20
   private queue: Request[] = []
@@ -99,7 +104,7 @@ export class AncsClient {
   stopCommand(): Uint8Array { return new Uint8Array([65,78,1,1,...le32(this.lastStartToken)]) }
   private clear(): void {
     if (this.timer !== null) clearTimeout(this.timer)
-    this.timer = null; this.sources.clear(); this.notifications.clear(); this.appNames.clear(); this.queue = []
+    this.timer = null; this.sources.clear(); this.notifications.clear(); this.appNames.clear(); this.hiddenUids.clear(); this.queue = []
     this.pending = null; this.response = []; this.fragments = []; this.packetKind = -1; this.sequence = 0
   }
   private recover(message = 'Notification relay interrupted. Retrying…'): void {
@@ -135,7 +140,16 @@ export class AncsClient {
   dismiss(key: string): boolean {
     const entry = [...this.notifications.entries()].find(([,n]) => n.key === key)
     if (!entry) return false
-    this.notifications.delete(entry[0]); this.sources.delete(entry[0]); this.changed(); return true
+    const [uid] = entry, source = this.sources.get(uid)
+    if (!source) return false
+    if (!this.hiddenUids.has(uid) && this.hiddenUids.size >= MAX_HIDDEN) {
+      // shortcut: refresh after 4096 hidden UIDs, revisit only if ANCS adds session-stable identifiers.
+      this.recover('Hidden notification capacity reached. Refreshing iPhone notification relay…')
+      return true
+    }
+    this.hiddenUids.add(uid); source.popup = false; this.notifications.delete(uid)
+    this.queue = this.queue.filter(request => request.uid !== uid || request.action !== undefined)
+    this.changed(); return true
   }
   receive(packet: Uint8Array): boolean {
     if (packet[0] !== 65 || packet[1] !== 78) return false
@@ -174,20 +188,26 @@ export class AncsClient {
     if (data.length !== 8 || data[0] > 2) { this.recover(); return }
     const uid = read32(data,4)
     if (data[0] === 2) {
-      this.sources.delete(uid); this.notifications.delete(uid)
+      this.sources.delete(uid); this.notifications.delete(uid); this.hiddenUids.delete(uid)
       this.queue = this.queue.filter(r => r.uid !== uid); this.changed(); return
     }
     const old = this.sources.get(uid)
     const source = {flags: data[1], category: data[2], revision: ++this.revision,
-      postTime: old?.postTime ?? Date.now(), popup: !old && data[0] === 0 && !(data[1] & 4)}
+      postTime: old?.postTime ?? Date.now(), popup: !old && data[0] === 0 && !suppressesPopup(data[1])}
     this.sources.set(uid, source)
+    const notification = this.notifications.get(uid)
+    if (notification) {
+      notification.suppressPopup = suppressesPopup(source.flags, notification.packageName)
+      this.changed(notification.key,false)
+    }
     while (this.sources.size > MAX_ACTIVE) {
       const oldest = this.sources.keys().next().value!
       this.sources.delete(oldest); this.notifications.delete(oldest)
       this.queue = this.queue.filter(r => r.uid !== oldest)
     }
     this.queue = this.queue.filter(r => r.uid !== uid || r.action !== undefined)
-    this.queue.push({uid, revision: source.revision}); this.pump()
+    if (!this.hiddenUids.has(uid)) this.queue.push({uid, revision: source.revision})
+    this.pump()
   }
   private pump(): void {
     if (this.state !== 'ready' || this.pending) return
@@ -246,7 +266,7 @@ export class AncsClient {
         if (notification.packageName === appId) notification.appName = name
       }
     }
-    if (source?.revision === revision) {
+    if (source?.revision === revision && !this.hiddenUids.has(uid)) {
       const key = `ancs:${this.token}:${uid}`
       if (appId !== undefined) {
         this.publish(uid,source)
@@ -270,8 +290,11 @@ export class AncsClient {
         }
       } else {
         const packageName = attrs.get(0)!, title = attrs.get(1)!, text = attrs.get(3)!
+        const suppressPopup = suppressesPopup(source.flags,packageName)
+        if (suppressPopup) source.popup = false
         this.notifications.set(uid,{key,packageName,appName:this.appNames.get(packageName) || fallbackAppName(packageName),title,text,bigText:text,
-          subText:'',infoText:'',summaryText:'',category:String(source.category),lines:[],postTime:source.postTime,when:source.postTime,actions:[],dismissLabel:'Hide on glasses'})
+          subText:'',infoText:'',summaryText:'',category:String(source.category),lines:[],postTime:source.postTime,when:source.postTime,actions:[],
+          dismissLabel:'Hide on glasses',suppressPopup})
         this.queue.unshift({uid,revision,metadata:true}); this.changed(key,false)
       }
     }

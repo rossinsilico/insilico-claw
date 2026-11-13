@@ -71,6 +71,45 @@ test('iOS installed apps launch, recover missing packages, and close before unin
   assert.deepEqual(calls, [['launch', 'installed', 'test.app'], ['reinstall', 'test.app'], ['close', 'test.app'], ['uninstall', 'test.app']]);
 });
 
+test('iOS controller promotes the shared session and passes explicit user Connect intent', async () => {
+  const calls=[];
+  const bridge={configureBrightness:async()=>{},setHeadUpEnabled:async enabled=>calls.push(['head-up',enabled]),
+    promoteToInteractive:async()=>calls.push('promote'),isSessionReady:()=>false};
+  const modules={
+    './device-addresses':{loadDeviceAddresses:()=>({right:'R',left:'L',ring:'R1'})},
+    './ios-peripheral-identity':{deviceAddressError:()=>null},
+    '../ui/dashboard-settings':{getBrightnessPreferences:()=>({})},
+    '../health/ring-session.ios':{ensureIosSession:async options=>{calls.push(options);return bridge;},claimIosSessionForUi:()=>calls.push('claim')},
+    '../ui/shell/shell':{shell:{getWindows:()=>[]}},
+  };
+  const {IosPreviewController}=load('app/g2/ios-preview-controller.ts',{require:id=>modules[id]??{}});
+  const host=Object.create(IosPreviewController.prototype);
+  Object.assign(host,{active:true,connecting:false,stopping:null,communicator:null,state:{phase:'disconnected'},
+    startedCommunicators:new WeakSet(),update(){},teardownPreviewDisplay(){},bindCommunicator(){},requestShellRender(){},
+    glance:{allowsHeadTilt:()=>false},
+    registerSurfaces:()=>Promise.resolve(),syncRingHealth(){}});
+  await host.connect(false,true);
+  assert.deepEqual(JSON.parse(JSON.stringify(calls)),[{userInitiated:true,allowScan:true},'claim',['head-up',false],'promote']);
+});
+
+test('iOS Disconnect lets the shared owner safely retire before native transport shutdown', async()=>{
+  const calls=[];let finishRelease;
+  const bridge={disconnect:async()=>calls.push('premature-native-disconnect')};
+  const modules={'../health/ring-session.ios':{
+    setIosSessionConnectionWanted:value=>calls.push(['wanted',value]),
+    releaseIosSession:async value=>{assert.equal(value,bridge);calls.push('prepare-and-close');await new Promise(resolve=>finishRelease=resolve);},
+  }};
+  const {IosPreviewController}=load('app/g2/ios-preview-controller.ts',{require:id=>modules[id]??{}});
+  const host=Object.create(IosPreviewController.prototype);
+  Object.assign(host,{stopping:null,communicator:bridge,notifications:null,state:{phase:'connected'},
+    update:phase=>calls.push(phase),logBluetooth(){},ensurePreviewDisplay(){},
+    unbindCommunicator(){this.communicator=null;}});
+  const stopping=host.disconnect();await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(calls.includes('premature-native-disconnect'),false);
+  assert.equal(calls.includes('prepare-and-close'),true);assert.equal(calls.includes('disconnected'),false);
+  finishRelease();await stopping;assert.equal(calls.at(-1),'disconnected');
+});
+
 test('iOS launch failures on a zeroed package fall back to the store page; other failures still report', async () => {
   const calls = [], failures = [], app = { packageId: 'test.app', name: 'Test' };
   let zeroed = true;
@@ -190,11 +229,12 @@ test('iOS bandwidth footer toggles live, polls only in foreground and resets its
     notifyPropertyChange() {}
     getActualSize() { return { width: 0, height: 0 }; }
     getViewById() { return null; }
-    static setRow() {} static setColumn() {}
+    static setRow() {} static setColumn() {} static setColumnSpan() {}
   }
+  class TabViewItem { constructor() { this.title = ''; this.view = null; } }
   const core = { Application: { suspendEvent: 'suspend', resumeEvent: 'resume',
     on: (key, fn) => appEvents.set(key, fn), off: key => appEvents.delete(key) },
-    Builder: { load: () => new View() }, Observable: View, Button: View, Color: class {}, Dialogs: {}, GridLayout: View, Image: View, Label: View, Page: View, StackLayout: View };
+    Builder: { load: () => new View() }, Observable: View, Button: View, Color: class {}, Dialogs: {}, GridLayout: View, Image: View, Label: View, Page: View, StackLayout: View, TabView: View, TabViewItem };
   const modules = {
     "../ui/input-monitor": load("app/ui/input-monitor.ts", {}),
     '../assistant/system-tools': { registerSystemTools() {} },
@@ -209,6 +249,7 @@ test('iOS bandwidth footer toggles live, polls only in foreground and resets its
     '../apps/launcher': { launcherEntries: () => [] },
     '../apps/all-apps': { ALL_APPS: [] },
     '../g2/ios-preview-controller': { IosPreviewController: class { resume() {} pause() {} } },
+    './companion-panels.ios': { createCompanionPanels: () => ({ health: new View(), apps: new View(), settings: new View(), refresh() {}, clearHealth() {} }) },
     './phone-gestures': { PhoneGestureRecognizer: class { cancel() {} } },
     './ble-bandwidth-meter': require('../.test-build/app/phone-ui/ble-bandwidth-meter.js'),
     '../native/ble-traffic': { sampleBleTraffic: () => totals },

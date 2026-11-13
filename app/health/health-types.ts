@@ -17,18 +17,19 @@
 export type SeriesMetric = "heartRate" | "spo2" | "hrv" | "steps" | "sleep";
 
 /** Metrics stored as bucketed samples. Sleep is per-session and excluded. */
-export type SampleMetric = "heartRate" | "spo2" | "hrv" | "steps" | "calories";
+export type SampleMetric = "heartRate" | "spo2" | "hrv" | "steps" | "activeCalories" | "calories";
 
 export const SAMPLE_METRICS: readonly SampleMetric[] = [
   "heartRate",
   "spo2",
   "hrv",
   "steps",
+  "activeCalories",
   "calories",
 ];
 
 /** Metrics whose bucket value is a SUM over the bucket, not a measurement. */
-export const CUMULATIVE_METRICS: readonly SampleMetric[] = ["steps", "calories"];
+export const CUMULATIVE_METRICS: readonly SampleMetric[] = ["steps", "activeCalories", "calories"];
 
 export function isCumulative(metric: SampleMetric): boolean {
   return CUMULATIVE_METRICS.includes(metric);
@@ -38,16 +39,29 @@ export const HOUR_MS = 3_600_000;
 export const TEN_MINUTES_MS = 600_000;
 export const DAY_MS = 86_400_000;
 
+export type R1SampleOrigin = {
+  kind: "r1-live";
+  ringId: string;
+  receivedAtMs: number;
+  dateSource: "ring-anchor" | "ring-latest" | "ring-sleep";
+};
+
+export type R1SampleProvenance = R1SampleOrigin & {
+  exportRevision: number;
+};
+
 /**
- * One stored bucket.
+ * One stored bucket or instantaneous ring reading.
  *
  * `min`/`max`/`avg` are what the ring reports for the physiological metrics.
- * For the cumulative ones (steps, calories) the ring reports a single count
+ * For cumulative activity metrics the ring reports a single count
  * per bucket, so all three carry that count and `total` carries it as well -
  * which keeps one shape for everything and lets a rollup sum `total` while
  * banding `min`/`max` without special-casing the reader.
  *
- * `startMs` is the LOCAL wall-clock start of the bucket. A record whose time
+ * `startMs` is the LOCAL wall-clock start of the bucket. `spanMs === 0` is a
+ * genuine instantaneous reading whose provenance dateSource is `ring-latest`.
+ * A record whose time
  * could not be resolved (a backlog page with no anchor; see the decode doc's
  * section 4) is not stored at all rather than stored with an invented time -
  * see `health-ingest.ts`.
@@ -60,6 +74,12 @@ export type HealthSample = {
   max: number;
   avg: number;
   total: number;
+  provenance?: R1SampleProvenance;
+};
+
+/** A decoded sample before the durable store assigns its export revision. */
+export type UnstoredHealthSample = Omit<HealthSample, "provenance"> & {
+  provenance?: R1SampleOrigin;
 };
 
 /**
@@ -87,8 +107,17 @@ export type SleepSession = {
   lightSec: number;
   deepSec: number;
   segments: readonly SleepSegment[];
+  /** Unscaled device field. No Celsius conversion is claimed. */
+  temperatureRaw?: number | null;
+  /** Signed offset reported alongside the session. */
+  utcOffsetMinutes?: number;
   /** False when startMs/endMs are ring-relative and could not be anchored. */
   timeResolved: boolean;
+  provenance?: R1SampleProvenance;
+};
+
+export type UnstoredSleepSession = Omit<SleepSession, "provenance"> & {
+  provenance?: R1SampleOrigin;
 };
 
 export type SleepSegment = {
@@ -162,7 +191,7 @@ export function rollupOf(samples: readonly HealthSample[]): Rollup | null {
 export const METRIC_LABELS: Readonly<Record<SeriesMetric, string>> = {
   heartRate: "Heart rate",
   spo2: "Blood oxygen",
-  hrv: "HRV",
+  hrv: "R1 RMSSD",
   steps: "Steps",
   sleep: "Sleep",
 };
@@ -170,7 +199,7 @@ export const METRIC_LABELS: Readonly<Record<SeriesMetric, string>> = {
 export const METRIC_UNITS: Readonly<Record<SeriesMetric, string>> = {
   heartRate: "bpm",
   spo2: "%",
-  hrv: "ms",
+  hrv: "raw",
   steps: "",
   sleep: "h",
 };
@@ -180,23 +209,26 @@ export const METRIC_UNITS: Readonly<Record<SeriesMetric, string>> = {
  *
  * These exist because the two enums differ at both ends: the phone GRAPHS
  * sleep (which is not a sample metric) and the glasses drill-down walks
- * calories (which is not a series metric, because the phone never got a
- * calories chart). A screen that iterates the sample metrics needs a label for
- * all five, so it gets its own map instead of special-casing the missing one.
+ * calories and active calories (which are not series metrics, because the phone
+ * never got those charts). A screen that iterates the sample metrics needs a
+ * label for every stored stream, so it gets its own map instead of
+ * special-casing the missing ones.
  */
 export const SAMPLE_METRIC_LABELS: Readonly<Record<SampleMetric, string>> = {
   heartRate: "Heart rate",
   spo2: "Blood oxygen",
-  hrv: "HRV",
+  hrv: "R1 RMSSD",
   steps: "Steps",
+  activeCalories: "Active calories",
   calories: "Calories",
 };
 
 export const SAMPLE_METRIC_UNITS: Readonly<Record<SampleMetric, string>> = {
   heartRate: "bpm",
   spo2: "%",
-  hrv: "ms",
+  hrv: "raw",
   steps: "",
+  activeCalories: "kcal",
   calories: "kcal",
 };
 
@@ -204,8 +236,9 @@ export const SAMPLE_METRIC_UNITS: Readonly<Record<SampleMetric, string>> = {
 export const SAMPLE_METRIC_SHORT_LABELS: Readonly<Record<SampleMetric, string>> = {
   heartRate: "HR",
   spo2: "SpO2",
-  hrv: "HRV",
+  hrv: "R1 RMSSD",
   steps: "Steps",
+  activeCalories: "Active cal",
   calories: "Calories",
 };
 

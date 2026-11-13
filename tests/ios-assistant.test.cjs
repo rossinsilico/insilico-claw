@@ -131,3 +131,26 @@ test('cancelling during a tool prevents subsequent tool side effects and a stall
   assert.deepEqual(calls, ['tool1']);
   backend.runTurn({ ...options, messages: [] }); deadline(); assert.match(failures[0], /too long/);
 });
+
+test('only explicit OpenClaw compatible models use the bounded long deadline', () => {
+  const delays = [];
+  const stream = () => ({ cancel() {} });
+  const { DirectAssistantBackend } = loader({ setTimeout: (_fn, ms) => { delays.push(ms); return delays.length; }, clearTimeout() {} }, {
+    '../native/openai-chat': { streamOpenAiCompatibleChat: stream },
+    '../native/openai': { streamOpenAiResponse: stream },
+    '../native/anthropic': {}, '../native/local-llm': {}, '../native/hermes': {},
+  })('app/assistant/direct-backend.ts');
+  const options = (provider, model = 'ordinary-model') => ({ provider, model, messages: [], buildTools: () => [], resolveToolName: name => name,
+    registry: { callTool: async () => ({ ok: true }) }, callbacks: { onTextDelta() {}, onToolActivity() {}, onTurnDone() {}, onError() {} } });
+  const backend = new DirectAssistantBackend();
+  backend.runTurn(options('openai-compatible', 'openclaw')).cancel();
+  backend.runTurn(options('openai-compatible', 'openclaw/main')).cancel();
+  backend.runTurn(options('openai-compatible', 'openclaw/glasses')).cancel();
+  backend.runTurn(options('openai-compatible', 'fixture-model')).cancel();
+  backend.runTurn(options('openai-compatible', 'venice-uncensored')).cancel();
+  backend.runTurn(options('openai')).cancel();
+  assert.deepEqual(delays, [
+    20 * 60 * 1000, 20 * 60 * 1000, 20 * 60 * 1000,
+    2 * 60 * 1000, 2 * 60 * 1000, 2 * 60 * 1000,
+  ]);
+});

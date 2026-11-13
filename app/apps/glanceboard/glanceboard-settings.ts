@@ -1,4 +1,10 @@
-import { ConfigSettingBoolean, ConfigSettingEnum, glassesHaveCompass } from "../../ui/dashboard-settings";
+import {
+  ConfigSettingBoolean,
+  ConfigSettingEnum,
+  glanceShowOnHeadTiltSetting,
+  glassesHaveCompass,
+  headUpTargetSetting,
+} from "../../ui/dashboard-settings";
 import { QUADRANT_LAYOUT, SIX_SLOT_LAYOUT, slotsVerticallyAdjacent, type GlanceLayout } from "./layout";
 import { type GlanceWidgetId } from "./widget";
 import { glanceWidgetSpans } from "./widgets";
@@ -47,18 +53,14 @@ export function glanceLayout(): GlanceLayout {
   return glanceLayoutSetting.get() === "2x3" ? SIX_SLOT_LAYOUT : QUADRANT_LAYOUT;
 }
 
-/**
- * Whether sleep-time gestures show the board at all. Off restores the plain
- * behaviour: a tap, hold or head-tilt while asleep does nothing (a head-tilt
- * wakes the regular UI), double-tap wakes.
- */
+/** Whether sleep-time taps and holds show the board; head-up is configured separately. */
 export const glanceboardEnabledSetting = new ConfigSettingBoolean({
   id: "glanceboard-enabled",
-  label: "Enable Glanceboard",
+  label: "Show on tap and hold",
   storageKey: "glanceboard.enabled",
   defaultValue: false,
   description:
-    "While the display is asleep, a tap, a long-press or a head-tilt shows the Glanceboard instead of the regular UI. Double-tap still wakes the regular UI.",
+    "While the display is asleep, a tap or long-press shows the Glanceboard. Head-up has its own Show setting; double-tap still wakes the regular UI.",
 });
 
 const TAP_DURATION_SECONDS = {
@@ -119,14 +121,7 @@ export const glanceShowOnLongPressSetting = new ConfigSettingBoolean({
   description: "A long-press or short-then-long-press while asleep shows the Glanceboard until the press is released.",
 });
 
-/** The head-tilt wake shows the board (for the tap duration) instead of the regular UI. */
-export const glanceShowOnHeadTiltSetting = new ConfigSettingBoolean({
-  id: "glanceboard-show-on-head-tilt",
-  label: "Show on head tilt",
-  storageKey: "glanceboard.showOnHeadTilt",
-  defaultValue: true,
-  description: "Tilting your head up while asleep shows the Glanceboard instead of waking the regular UI.",
-});
+export { glanceShowOnHeadTiltSetting, headUpTargetSetting };
 
 const DEPTH_VALUES = ["-64", "-48", "-32", "-16", "0", "16", "32", "48", "64"] as const;
 export type GlanceDepth = (typeof DEPTH_VALUES)[number];

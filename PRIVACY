@@ -1,5 +1,34 @@
 # Faceclaw Privacy Policy
 
+## Insilico Claw fork additions
+
+Insilico Claw is an independent FaceClaw fork. The upstream policy below
+describes inherited integrations. The fork also adds the following iOS paths.
+
+R1 health measurements and synchronization receipts are saved in the app's
+private storage. When you grant the relevant Apple Health permissions, the app
+can read supported summaries and write eligible, dated R1 measurements to
+HealthKit. Permissions are controlled by measurement type in Apple Health.
+The fork does not send these records to its maintainer or a maintainer-operated
+health service.
+
+Apple: https://www.apple.com/legal/privacy/data/en/health-app/
+
+Health access by the assistant requires a separate opt-in for the configured
+assistant destination. If enabled, a requested, limited health summary can be
+sent to that destination and processed by the assistant services you configured.
+Changing the destination requires renewed sharing consent. Enabling HealthKit
+permissions alone does not enable assistant sharing.
+
+The optional OpenClaw and G2C connections send prompts, replies, requested tool
+results and terminal/session interactions to the endpoint you configure. Those
+endpoints and their operators may access that information. Connection credentials
+are supplied by you and are not bundled as a working account in this repository.
+The fork's local notification source preferences store app identities and display
+choices, not notification titles or message bodies.
+
+## Upstream policy
+
 Faceclaw's own usage statistics are off unless you opt in. Separately, Apple
 collects and shares information when you use an iOS TestFlight build, even
 when Faceclaw statistics are set to None. Information you voluntarily send

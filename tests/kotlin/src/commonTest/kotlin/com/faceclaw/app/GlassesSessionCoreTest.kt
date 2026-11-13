@@ -13,13 +13,13 @@ private const val LEFT = "AA:00:00:00:00:02"
 private const val STOCK_VERSION = "2.3.0.24"
 
 /** The test platform with a clock the tests can jump forward (the real waits keep real time). */
-private class ClockPlatform(private val base: ProtocolPlatform) : ProtocolPlatform by base {
+internal class ClockPlatform(private val base: ProtocolPlatform) : ProtocolPlatform by base {
     @Volatile var offsetMs = 0L
 
     override fun elapsedRealtimeMs(): Long = base.elapsedRealtimeMs() + offsetMs
 }
 
-private fun waitUntil(timeoutMs: Long, condition: () -> Boolean): Boolean {
+internal fun waitUntil(timeoutMs: Long, condition: () -> Boolean): Boolean {
     val platform = testPlatform()
     val deadline = platform.elapsedRealtimeMs() + timeoutMs
     while (platform.elapsedRealtimeMs() < deadline) {
@@ -39,7 +39,7 @@ private fun ByteArray.containsSequence(needle: ByteArray): Boolean {
 }
 
 /** One logical write as the fake link saw it: the frames, the decoded pb, and the in-flight message (if any). */
-private class Write(
+internal class Write(
     val address: String,
     val sid: Int,
     val frames: List<ByteArray>,
@@ -55,7 +55,7 @@ private class Write(
  * firmware would: EvenHub/settings/auth requests get a matching ack frame, CFW stream
  * messages get one ACK per lens.
  */
-private class FakeLink(private val platform: ProtocolPlatform) : SessionLink {
+internal class FakeLink(private val platform: ProtocolPlatform) : SessionLink {
     lateinit var core: GlassesSessionCore
     private val lock = platform.createLock()
     private val writesList = ArrayList<Write>()
@@ -74,6 +74,9 @@ private class FakeLink(private val platform: ProtocolPlatform) : SessionLink {
     @Volatile var caseInfo: ByteArray? = null
     /** Settings READ acks report the glasses charging in their case (80%). */
     @Volatile var headsetCharging = false
+    val headUpAngles = mutableMapOf(RIGHT to 30, LEFT to 30)
+    var headUpQueryReply: ((String, Int) -> ByteArray)? = null
+    @Volatile var disconnectOnHeadUpQueryAddress: String? = null
     @Volatile var connects = 0
     var seq = 0
 
@@ -114,10 +117,23 @@ private class FakeLink(private val platform: ProtocolPlatform) : SessionLink {
         val write = Write(address, sid, frames, pb, inFlight?.kind, inFlight?.label, magic, inFlight?.message?.copyOf())
         lock.withLock { writesList.add(write) }
         if (inFlight != null && inFlight.kind !in muted) {
+            if (inFlight.kind == "head-up-angle-write") {
+                val settings = BleProtocol.readFieldBytes(pb, 3)
+                val headUp = settings?.let { BleProtocol.readFieldBytes(it, 4) }
+                headUpAngles[address] = headUp?.let { BleProtocol.readVarintFieldValue(it, 2, -1) } ?: -1
+            }
+            if (inFlight.kind == "head-up-angle-query" && disconnectOnHeadUpQueryAddress == address) {
+                core.onConnectionStateChange(address, false)
+                return true
+            }
             if (sid == CfwTransport.SID) {
                 for (lens in 1..2) core.onNotification(address, BleProtocol.NOTIFY_CHAR_UUID, cfwAck(magic, lens, inFlight.message.size, inFlight.cfwChecksum))
             } else {
-                core.onNotification(address, BleProtocol.NOTIFY_CHAR_UUID, ackFrame(sid, magic, inFlight.kind))
+                val reply = if (inFlight.kind == "head-up-angle-query")
+                    headUpQueryReply?.invoke(address, magic) ?: headUpStatusFrame(magic, headUpAngles[address] ?: 0)
+                else
+                    ackFrame(sid, magic, inFlight.kind)
+                core.onNotification(address, BleProtocol.NOTIFY_CHAR_UUID, reply)
             }
         }
         return true
@@ -140,6 +156,13 @@ private class FakeLink(private val platform: ProtocolPlatform) : SessionLink {
         else
             BleProtocol.encodeVarintField(1, 1) + BleProtocol.encodeVarintField(2, magic)
         return BleProtocol.framePb(body, sid, 0x00, seq++)[0]
+    }
+
+    fun headUpStatusFrame(magic: Int, angle: Int, command: Int = 2): ByteArray {
+        val status = BleProtocol.encodeVarintField(7, 1) + BleProtocol.encodeVarintField(8, angle)
+        val body = BleProtocol.encodeVarintField(1, command) + BleProtocol.encodeVarintField(2, magic) +
+            BleProtocol.encodeBytesField(4, status)
+        return BleProtocol.framePb(body, BleProtocol.SID_UI_SETTING, 0x00, seq++)[0]
     }
 
     override fun disconnect(address: String) {
@@ -194,7 +217,7 @@ private fun cfwAck(streamId: Int, lens: Int, size: Int, checksum: Int): ByteArra
     return packet
 }
 
-private class FakeHost(private val platform: ProtocolPlatform) : SessionHost {
+internal class FakeHost(private val platform: ProtocolPlatform) : SessionHost {
     private val lock = platform.createLock()
     private val lines = ArrayList<String>()
     private var done: Latch? = null
@@ -237,7 +260,7 @@ private class FakeHost(private val platform: ProtocolPlatform) : SessionHost {
     }
 }
 
-private class FakeListener : FaceclawBleCommunicatorListener {
+internal class FakeListener : FaceclawBleCommunicatorListener {
     val phases = ArrayList<String>()
     @Volatile var lastStatus = ""
     val events = ArrayList<String>()
@@ -283,7 +306,7 @@ private class FakeListener : FaceclawBleCommunicatorListener {
     }
 }
 
-private class Session {
+internal class Session {
     val platform = ClockPlatform(testPlatform())
     val link = FakeLink(platform)
     val host = FakeHost(platform)
@@ -451,6 +474,87 @@ class GlassesSessionCoreTest {
         assertTrue(s.core.awaitEvenHubSessionReady(5_000))
         val ready = byteArrayOf(70, 67, 1, BleProtocol.FACECLAW_WAKE_OP_READY.toByte(), (nonce and 0xff).toByte(), (nonce ushr 8).toByte())
         assertEquals(2, s.link.writes.count { it.pb.containsSequence(ready) }, "READY written to both arms")
+        s.core.disconnect()
+    }
+
+    @Test
+    fun disabledHeadUpRepliesReadyWithoutResuming() {
+        val s = Session()
+        s.core.setHeadUpEnabled(false)
+        s.startAndAwaitLayout()
+        assertTrue(s.core.suspendEvenHubSession())
+
+        val nonce = 0x2345
+        val event = byteArrayOf(70, 67, 1, BleProtocol.FACECLAW_WAKE_EVENT_HEAD_UP.toByte(), (nonce and 0xff).toByte(), (nonce ushr 8).toByte())
+        val pb = BleProtocol.encodeVarintField(1, 1) + BleProtocol.encodeVarintField(2, 0) + BleProtocol.encodeBytesField(BleProtocol.FACECLAW_WAKE_EVENT_FIELD, event)
+        s.core.onNotification(RIGHT, BleProtocol.NOTIFY_CHAR_UUID, BleProtocol.framePb(pb, BleProtocol.SID_UI_SETTING, BleProtocol.FLAG_NOTIFY, 9)[0])
+
+        val ready = byteArrayOf(70, 67, 1, BleProtocol.FACECLAW_WAKE_OP_READY.toByte(), (nonce and 0xff).toByte(), (nonce ushr 8).toByte())
+        val claim = byteArrayOf(70, 67, 1, BleProtocol.FACECLAW_WAKE_OP_CLAIM.toByte(), (nonce and 0xff).toByte(), (nonce ushr 8).toByte())
+        assertTrue(waitUntil(3_000) { s.link.writes.count { it.pb.containsSequence(ready) } == 2 }, "READY written to both arms")
+        assertEquals(0, s.link.writes.count { it.pb.containsSequence(claim) })
+        assertFalse(s.listener.events.contains("display-wake:${BleProtocol.EVENT_HEAD_UP}"))
+        assertEquals(1, s.link.writes.count { it.kind == "prelude" })
+        assertEquals(-1, s.core.monitor.withLock { s.core.faceclawWakePendingNonce })
+        s.core.disconnect()
+    }
+
+    @Test
+    fun headUpCanBeEnabledDuringLiveSession() {
+        val s = Session()
+        s.startAndAwaitLayout()
+        assertTrue(s.core.suspendEvenHubSession())
+        s.core.setHeadUpEnabled(false)
+        s.core.setHeadUpEnabled(true)
+
+        val nonce = 0x3456
+        val event = byteArrayOf(70, 67, 1, BleProtocol.FACECLAW_WAKE_EVENT_HEAD_UP.toByte(), (nonce and 0xff).toByte(), (nonce ushr 8).toByte())
+        val pb = BleProtocol.encodeVarintField(1, 1) + BleProtocol.encodeVarintField(2, 0) + BleProtocol.encodeBytesField(BleProtocol.FACECLAW_WAKE_EVENT_FIELD, event)
+        s.core.onNotification(RIGHT, BleProtocol.NOTIFY_CHAR_UUID, BleProtocol.framePb(pb, BleProtocol.SID_UI_SETTING, BleProtocol.FLAG_NOTIFY, 9)[0])
+
+        val claim = byteArrayOf(70, 67, 1, BleProtocol.FACECLAW_WAKE_OP_CLAIM.toByte(), (nonce and 0xff).toByte(), (nonce ushr 8).toByte())
+        assertTrue(waitUntil(3_000) { s.link.writes.count { it.pb.containsSequence(claim) } == 2 }, "CLAIM written to both arms")
+        assertTrue(s.listener.events.contains("display-wake:${BleProtocol.EVENT_HEAD_UP}"))
+        s.core.disconnect()
+    }
+
+    @Test
+    fun disablingHeadUpCancelsItsPendingClaim() {
+        val s = Session()
+        s.startAndAwaitLayout()
+        assertTrue(s.core.suspendEvenHubSession())
+
+        val nonce = 0x4567
+        val event = byteArrayOf(70, 67, 1, BleProtocol.FACECLAW_WAKE_EVENT_HEAD_UP.toByte(), (nonce and 0xff).toByte(), (nonce ushr 8).toByte())
+        val pb = BleProtocol.encodeVarintField(1, 1) + BleProtocol.encodeVarintField(2, 0) + BleProtocol.encodeBytesField(BleProtocol.FACECLAW_WAKE_EVENT_FIELD, event)
+        s.core.onNotification(RIGHT, BleProtocol.NOTIFY_CHAR_UUID, BleProtocol.framePb(pb, BleProtocol.SID_UI_SETTING, BleProtocol.FLAG_NOTIFY, 9)[0])
+
+        val claim = byteArrayOf(70, 67, 1, BleProtocol.FACECLAW_WAKE_OP_CLAIM.toByte(), (nonce and 0xff).toByte(), (nonce ushr 8).toByte())
+        assertTrue(waitUntil(3_000) { s.link.writes.count { it.pb.containsSequence(claim) } == 2 })
+        s.core.setHeadUpEnabled(false)
+        val ready = byteArrayOf(70, 67, 1, BleProtocol.FACECLAW_WAKE_OP_READY.toByte(), (nonce and 0xff).toByte(), (nonce ushr 8).toByte())
+        assertTrue(waitUntil(3_000) { s.link.writes.count { it.pb.containsSequence(ready) } == 2 }, "READY cancels the pending head-up claim")
+        assertEquals(-1, s.core.monitor.withLock { s.core.faceclawWakePendingNonce })
+        s.core.disconnect()
+    }
+
+    @Test
+    fun disablingHeadUpDoesNotCancelPendingDoubleTap() {
+        val s = Session()
+        s.startAndAwaitLayout()
+        assertTrue(s.core.suspendEvenHubSession())
+
+        val nonce = 0x5678
+        val event = byteArrayOf(70, 67, 1, 1, (nonce and 0xff).toByte(), (nonce ushr 8).toByte())
+        val pb = BleProtocol.encodeVarintField(1, 1) + BleProtocol.encodeVarintField(2, 0) + BleProtocol.encodeBytesField(BleProtocol.FACECLAW_WAKE_EVENT_FIELD, event)
+        s.core.onNotification(RIGHT, BleProtocol.NOTIFY_CHAR_UUID, BleProtocol.framePb(pb, BleProtocol.SID_UI_SETTING, BleProtocol.FLAG_NOTIFY, 9)[0])
+
+        val claim = byteArrayOf(70, 67, 1, BleProtocol.FACECLAW_WAKE_OP_CLAIM.toByte(), (nonce and 0xff).toByte(), (nonce ushr 8).toByte())
+        assertTrue(waitUntil(3_000) { s.link.writes.count { it.pb.containsSequence(claim) } == 2 })
+        s.core.setHeadUpEnabled(false)
+        val ready = byteArrayOf(70, 67, 1, BleProtocol.FACECLAW_WAKE_OP_READY.toByte(), (nonce and 0xff).toByte(), (nonce ushr 8).toByte())
+        assertEquals(0, s.link.writes.count { it.pb.containsSequence(ready) })
+        assertEquals(nonce, s.core.monitor.withLock { s.core.faceclawWakePendingNonce })
         s.core.disconnect()
     }
 

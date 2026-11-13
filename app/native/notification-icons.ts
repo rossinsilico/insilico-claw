@@ -21,6 +21,7 @@ const ICON_CACHE_MS = 60_000;
 
 let cachedIcons: GrayImage[] = [];
 let cachedKeys: string[] = [];
+let cachedPackageNames: string[] = [];
 let cachedAtMs = 0;
 const keyedIconCache = new Map<string, { icon: GrayImage | null; atMs: number }>();
 const KEYED_ICON_CACHE_MAX = 128;
@@ -45,6 +46,8 @@ export type NotificationIconsResult = {
    * member of its group (which gets one icon) the icon was taken from.
    */
   keys: string[];
+  /** Source package names in step with icons and keys; empty when fresh metadata cannot resolve a key. */
+  packageNames: string[];
   /** True when the icons came from an expired (or empty) cache under allowStale. */
   stale: boolean;
 };
@@ -58,7 +61,7 @@ export type NotificationIconsResult = {
  * on what is in the tray.
  */
 export function readActiveNotificationIcons(maxIcons: number, allowStale: boolean): NotificationIconsResult {
-  if (!global.isAndroid || maxIcons <= 0) return { icons: [], keys: [], stale: false };
+  if (!global.isAndroid || maxIcons <= 0) return { icons: [], keys: [], packageNames: [], stale: false };
 
   const now = Date.now();
   if (cachedAtMs > 0 && now - cachedAtMs < ICON_CACHE_MS) {
@@ -94,16 +97,25 @@ export function readActiveNotificationIcons(maxIcons: number, allowStale: boolea
   for (let index = 0; index < iconCount; index++) {
     keys.push(index < keyList.size() ? String(keyList.get(index)) : "");
   }
+  const packageByKey = new Map(keys.length ? readActiveNotifications(ALL_NOTIFICATIONS).map((notification) =>
+    [notification.key, notification.packageName] as const) : []);
+  const packageNames = keys.map((key) => packageByKey.get(key) ?? "");
 
   cachedIcons = icons;
   cachedKeys = keys;
+  cachedPackageNames = packageNames;
   cachedAtMs = now;
   return cachedIconsResult(maxIcons, false);
 }
 
 /** Copies of the first maxIcons cached icons, with their keys. */
 function cachedIconsResult(maxIcons: number, stale: boolean): NotificationIconsResult {
-  return { icons: cachedIcons.slice(0, maxIcons).map(icon => icon.clone()), keys: cachedKeys.slice(0, maxIcons), stale };
+  return {
+    icons: cachedIcons.slice(0, maxIcons).map(icon => icon.clone()),
+    keys: cachedKeys.slice(0, maxIcons),
+    packageNames: cachedPackageNames.slice(0, maxIcons),
+    stale,
+  };
 }
 
 export type NotificationIconResult = {
@@ -316,6 +328,15 @@ export function readActiveNotifications(maxNotifications = 50): AndroidNotificat
   } catch {
     return [];
   }
+}
+
+/** Android's assistant behavior is unchanged; iOS overrides these with ANCS relay state. */
+export function isNotificationRelayReady(): boolean {
+  return true;
+}
+
+export function notificationRelayMessage(): string {
+  return "No current Android notifications.";
 }
 
 export function invokeNotificationAction(notificationKey: string, actionIndex: number): boolean {

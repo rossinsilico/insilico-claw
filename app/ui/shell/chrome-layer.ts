@@ -7,6 +7,7 @@ import { truncateText } from "../../graphics/textwrap";
 import { activeAmbientCards } from "./ambient-cards";
 import { BATTERY_ICON_WIDTH, DENSE_BATTERY_BLOCK_HEIGHT, drawBattery, drawDenseBatteries, type BatteryDevice } from "../../graphics/battery";
 import { ALL_NOTIFICATIONS, readActiveNotificationIcons } from "../../native/notification-icons";
+import { readNotificationSources } from "../../native/notification-sources";
 import { NOTIFICATION_ICON_SIZE } from "../../native/notification-types";
 import { readPhoneBatteryState } from "../../native/phone-battery";
 import { noteStaleDataUsed, renderPassAllowsStaleData } from "../../util/render-freshness";
@@ -892,7 +893,7 @@ export class ShellChromeLayer implements Layer {
    */
   private rowStatusItems(state: ShellChromeState): RowStatusItem[] {
     const items: RowStatusItem[] = [];
-    const { icons, keys, stale } = readActiveNotificationIcons(ALL_NOTIFICATIONS, renderPassAllowsStaleData());
+    const { icons, keys, stale } = readStatusNotificationIcons(ALL_NOTIFICATIONS);
     if (stale) {
       noteStaleDataUsed();
     }
@@ -1018,7 +1019,7 @@ export class ShellChromeLayer implements Layer {
     const iconsX = clockX + Math.ceil(font.measureText(clock)) + 16;
     const maxIcons = Math.max(0, ((trayLeft - NOTIFICATIONS_GAP - iconsX) / NOTIFICATION_ICON_STEP) | 0);
     if (maxIcons > 0) {
-      const { icons, keys, stale } = readActiveNotificationIcons(maxIcons, renderPassAllowsStaleData());
+      const { icons, keys, stale } = readStatusNotificationIcons(maxIcons);
       if (stale) {
         noteStaleDataUsed();
       }
@@ -1298,6 +1299,24 @@ type Rect = { x: number; y: number; width: number; height: number };
 
 /** A status bar item's icon as drawn: the item, and its selection box. */
 type StatusEntry = Rect & StatusItem;
+
+/** Apply per-source admission before either status layout limits or selects notification icons. */
+function readStatusNotificationIcons(maxIcons: number) {
+  const result = readActiveNotificationIcons(ALL_NOTIFICATIONS, renderPassAllowsStaleData());
+  const hiddenPackages = new Set(readNotificationSources()
+    .filter((source) => !source.showStatusIcon)
+    .map((source) => source.packageName));
+  const admitted = result.icons.map((_, index) => index).filter((index) => {
+    const packageName = result.packageNames[index];
+    return !!packageName && !hiddenPackages.has(packageName);
+  });
+  const shown = admitted.slice(0, Math.max(0, maxIcons));
+  return {
+    icons: shown.map((index) => result.icons[index]!),
+    keys: shown.map((index) => result.keys[index] ?? ""),
+    stale: result.stale,
+  };
+}
 
 /** A notification's status item, if its icon came with a key. */
 function notificationItem(key: string | undefined): StatusItem | null {

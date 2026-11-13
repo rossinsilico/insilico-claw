@@ -576,20 +576,22 @@ class BleProtocol {
         }
 
         /**
-         * RING_CONNECT_INFO(6) with RingInfo{connectRing, ringMac, ringName}. connectRing is
-         * declared `bytes` but read by the firmware as one byte. Every call overwrites the glasses'
+         * RING_CONNECT_INFO(6) with RingInfo{connectRing, ringMac, ringName}. Stock 2.3.0.24's
+         * nanopb descriptor declares connectRing BOOL; the unofficial bytes schema is wrong. Every call overwrites the glasses'
          * ring target with ringMac/ringName, so pass the target the glasses themselves reported
          * when one is known. Only the ring-owning temple acts on connect=true; the firmware
          * ignores connect requests closer than ~20 s apart.
          */
         @JvmStatic
         fun buildRingConnectRequest(magic: Int, connect: Boolean, ringMac: ByteArray, ringName: ByteArray): ByteArray {
+            require(ringMac.size == 6) { "A six-byte ring MAC is required" }
+            require(ringName.size <= 16) { "Ring name exceeds the firmware's 16-byte limit" }
             return concat(
                 CollectionUtils.listOf(
                     encodeVarintField(1, DEV_CFG_RING_CONNECT_INFO_CMD),
                     encodeVarintField(2, magic),
                     encodeMessageField(5, concat(CollectionUtils.listOf(
-                        encodeBytesField(1, byteArrayOf(if (connect) 1 else 0)),
+                        encodeVarintField(1, if (connect) 1 else 0),
                         encodeBytesField(2, ringMac),
                         encodeBytesField(3, ringName),
                     ))),
@@ -660,6 +662,36 @@ class BleProtocol {
                     encodeMessageField(4, request),
                 )
             )
+        }
+
+        /** Stock 2.3.0.24 HeadUp oneof field 2; writing it preserves switch and calibration. */
+        @JvmStatic
+        fun buildSetHeadUpAngle(magic: Int, angle: Int): ByteArray {
+            require(angle in 0..60) { "Head-up angle must be between 0 and 60" }
+            return concat(
+                CollectionUtils.listOf(
+                    encodeVarintField(1, 1),
+                    encodeVarintField(2, magic),
+                    encodeMessageField(3, encodeMessageField(4, encodeVarintField(2, angle))),
+                )
+            )
+        }
+
+        /** Correlated command-2 full-status angle, or -1 for any non-status/malformed reply. */
+        @JvmStatic
+        fun parseHeadUpAngle(pb: ByteArray?, expectedMagic: Int): Int {
+            if (pb == null) return -1
+            val root = stripTrailingCrc(pb)
+            if (!isWellFormedProtobuf(root)
+                    || readVarintFieldValue(root, 1, -1) != 2
+                    || readVarintFieldValue(root, 2, -1) != expectedMagic) return -1
+            val status = readFieldBytes(root, 4) ?: return -1
+            if (!isWellFormedProtobuf(status)) return -1
+            val angleWire = fieldWireType(status, 8)
+            if (angleWire < 0) return 0
+            if (angleWire != 0) return -1
+            val angle = readVarintFieldValue(status, 8, -1)
+            return if (angle in 0..60) angle else -1
         }
 
         /**
@@ -1382,6 +1414,36 @@ class BleProtocol {
                 offset = (length.next + length.value)
             }
             return defaultValue
+        }
+
+        private fun fieldWireType(pb: ByteArray, fieldNumber: Int): Int {
+            var offset = 0
+            while (offset < pb.size) {
+                val key = readVarint(pb, offset) ?: return -2
+                offset = key.next
+                val wire = key.value and 0x07
+                if (key.value shr 3 == fieldNumber) return wire
+                offset = skipField(pb, offset, wire) ?: return -2
+            }
+            return -1
+        }
+
+        private fun isWellFormedProtobuf(pb: ByteArray): Boolean {
+            var offset = 0
+            while (offset < pb.size) {
+                val key = readVarint(pb, offset) ?: return false
+                if (key.value shr 3 == 0) return false
+                offset = skipField(pb, key.next, key.value and 0x07) ?: return false
+            }
+            return offset == pb.size
+        }
+
+        private fun skipField(pb: ByteArray, offset: Int, wire: Int): Int? = when (wire) {
+            0 -> readVarint(pb, offset)?.next
+            1 -> (offset + 8).takeIf { it <= pb.size }
+            2 -> readVarint(pb, offset)?.let { (it.next + it.value).takeIf { end -> end <= pb.size } }
+            5 -> (offset + 4).takeIf { it <= pb.size }
+            else -> null
         }
 
         /**

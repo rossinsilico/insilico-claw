@@ -2,6 +2,7 @@ import { startRemoteInput } from "../remote/service"
 import type { KeyboardInputSession } from '../ui/shell/keyboard-input'
 import { acceptInput, resetRingInputFilter } from "../ui/input-monitor";
 import { bindIosNotifications, iosNotificationsChanged, onIosNotificationPopup, readActiveNotifications } from '../native/notification-icons.ios'
+import { shouldShowNotificationOnGlasses } from '../native/notification-sources'
 import { launcherEntries } from '../apps/launcher'
 import { discardZeroedEvenHubPackage, getInstalledEvenHubAppById, installedEvenHubPackageId, uninstallEvenHubPackage } from '../apps/evenhub/installed-apps'
 import { isInstalledPackagePresent } from '../apps/evenhub/updates'
@@ -14,12 +15,13 @@ import { registerRoamTools } from '../assistant/roam-tools'
 import { IosNavigationSensors } from '../native/ios-navigation-sensors'
 import { bindCompassSession, receiveCompassEvent } from '../native/compass.ios'
 import { bindBandwidthBenchmarkSession } from '../native/bandwidth-benchmark.ios'
+import { bindHeadUpSettingsSession } from '../native/head-up-settings'
 import { Dialogs, File, knownFolders, path, Utils, type ImageSource } from '@nativescript/core'
 import { iosVoiceInput } from '../native/ios-voice-input'
 import { voiceActivity } from '../ui/shell/voice-activity'
 import { nightscoutBridge } from '../native/nightscout-bridge'
 import { weatherBridge } from '../native/weather'
-import { FaceclawCommunicatorBridge, resolveIosPeripherals, type CommunicatorState, type RawInputEvent } from '../native/faceclaw-communicator.ios'
+import { FaceclawCommunicatorBridge, type CommunicatorState, type RawInputEvent } from '../native/faceclaw-communicator.ios'
 import { PreviewDisplayTarget, type DisplayTarget } from '../native/preview-display.ios'
 import { AncsClient, ANCS_FIRMWARE_VERSION } from './ancs-client'
 import { G1V0_IMAGE } from '../g1/firmware/g1v0-image'
@@ -53,10 +55,13 @@ import { onAnySettingChanged,
   previewColorSetting, lockScreenEnabledSetting, getBrightnessPreferences, getStringSettingById,
   nightscoutSiteUrlSetting, nightscoutApiTokenSetting, voiceProviderSetting, elevenLabsApiKeySetting,
   openAiApiKeySetting, sonioxApiKeySetting, whisperServerApiKeySetting, whisperServerLanguageSetting,
-  whisperServerModelSetting, whisperServerUrlSetting, ringConnectionModeSetting, saveTranscribeAudioSetting, glassesTypeSetting, shouldPopUpNewNotification } from '../ui/dashboard-settings'
+  whisperServerModelSetting, whisperServerUrlSetting, ringControlsOnlyWhileWornSetting, saveTranscribeAudioSetting, glassesTypeSetting, shouldPopUpNewNotification, newNotificationDisplaySetting } from '../ui/dashboard-settings'
 import { transcriptionKey, type VoiceProviderSelection } from '../native/cloud-stt-provider'
 import type { PhoneGesture } from '../phone-ui/phone-gestures'
 import { claimGlassesOnboardingAutoLaunch, ONBOARDING_APP_ID } from '../apps/onboarding/onboarding-progress'
+import { syncAutomaticR1Health } from '../health/healthkit-sync.ios'
+import { ensureIosSession, claimIosSessionForUi, releaseIosSession, setIosSessionConnectionWanted,
+  resumeIosRingHealth, syncIosRingPolicy } from '../health/ring-session.ios'
 
 const SHELL_SURFACE_ID = 'shell'
 // voiceActivity holder for continuous capture (Transcribe), as on Android.
@@ -148,6 +153,8 @@ export class IosPreviewController {
   private readonly lockObservers: any[] = []
   private phoneLocked = false
   private glassesWorn: boolean | null = null
+  private ringHoldActive = false
+  private ringInputEpoch = 0
   private glassesLocked = false
   private lockEnabled = lockScreenEnabledSetting.get()
   private acknowledgedFrames = 0
@@ -200,6 +207,9 @@ export class IosPreviewController {
     shell.configure({
       actions: this.actions,
       voiceInputEnabled: true,
+      supportsTimedNotificationVisuals: () => glassesTypeSetting.get() === 'g2'
+        && /^Faceclaw\/(\d+)/.test(this.state.capabilities)
+        && Number(this.state.capabilities.split('/')[1]) >= 29,
       onKeyboardInputChanged: session => this.onKeyboardInputChanged(session ? {
         targets: session.targets,
         setText: text => { if (this.active && !this.glassesLocked) session.setText(text) },
@@ -248,7 +258,13 @@ export class IosPreviewController {
     shell.focusWindow(launcher.windowId)
     onIosNotificationPopup(key => {
       const notification = readActiveNotifications(128).find(n => n.key === key)
-      if (this.glassesLocked || !notification || !shouldPopUpNewNotification(notification.packageName)) return
+      const display = newNotificationDisplaySetting.get()
+      const sourceEnabled = notification ? shouldShowNotificationOnGlasses(notification.packageName) : false
+      const eligible = notification && !notification.suppressPopup && shouldPopUpNewNotification(notification.packageName)
+      const reason = !notification ? 'missing' : this.glassesLocked ? 'locked'
+        : notification.suppressPopup ? 'relay-quiet' : !eligible ? display === 'off' ? 'global-off' : 'source-muted' : 'eligible'
+      this.logBluetooth('Notification popup: ' + JSON.stringify({ appId: notification?.packageName ?? null, sourceEnabled, display, reason }))
+      if (reason !== 'eligible') return
       const woke = !shell.isScreenOn() && shell.wake('sidebar')
       shell.openNotificationModal(key, woke)
       this.requestShellRender()
@@ -285,7 +301,7 @@ export class IosPreviewController {
       injectInput: kind => this.injectWatchInput(kind),
       launchApp: id => this.launchApp(id),
       // The watch's Connect/Disconnect are explicit user choices, like the phone's own buttons.
-      connect: () => { resumeAutoReconnect(); return this.connect(true) },
+      connect: () => { resumeAutoReconnect(); return this.connect(true, true) },
       disconnect: () => { suppressAutoReconnect(); return this.disconnect() },
       setGlassesLocked: locked => this.setGlassesLocked(locked),
       requestShellRender: () => this.requestShellRender(),
@@ -349,6 +365,7 @@ export class IosPreviewController {
     this.requestShellRender()
     this.syncEvenHubPhoneUi()
     this.syncContinuousCapture()
+    this.syncRingHealth(true)
   }
   pause(): void {
     if (!this.active) return
@@ -417,7 +434,10 @@ export class IosPreviewController {
     const phone = readPhoneBatteryState()
     this.logBluetooth(`Phone battery ${phone.battery ?? "unknown"}% charging=${phone.charging}`)
     this.offSettings = onAnySettingChanged(() => {
+      syncIosRingPolicy()
+      void this.communicator?.setHeadUpEnabled(this.glance.allowsHeadTilt()).catch(error => this.fail(error))
       this.syncLockSetting()
+      if (ringControlsOnlyWhileWornSetting.get() && this.glassesWorn !== true) this.cancelRingHoldForRemoval()
       this.pushBrightness()
       this.relayout()
       shell.foregroundWindow()?.requestRender()
@@ -461,12 +481,24 @@ export class IosPreviewController {
     // Putting the glasses on (an observed OFF_HEAD -> ON_HEAD transition, not
     // a session's first snapshot) wakes the screen, to the lock notice if locked.
     const putOn = wearing && this.glassesWorn === false
+    if (!wearing) this.ringInputEpoch++
     this.glassesWorn = wearing
     this.wearRemote?.schedulePublish()
     this.syncPresence()
     this.logBluetooth(`Glasses wear state: ${wearing ? 'ON_HEAD' : 'OFF_HEAD'}`)
+    if (!wearing && ringControlsOnlyWhileWornSetting.get()) this.cancelRingHoldForRemoval()
     if (!wearing && this.phoneLocked && this.lockEnabled) this.setGlassesLocked(true)
     if (putOn && this.runtimeRunning && !shell.isScreenOn()) shell.wake('sidebar')
+  }
+  private cancelRingHoldForRemoval(): void {
+    const task = this.inputQueue.then(() => {
+      if (!this.ringHoldActive) return
+      this.ringHoldActive = false
+      this.glance.dismiss()
+      if (shell.isScreenOn()) shell.sleep()
+      this.requestShellRender()
+    })
+    this.inputQueue = task.catch(error => this.fail(error))
   }
   private setGlassesLocked(locked: boolean): void {
     if (locked === this.glassesLocked) return
@@ -640,6 +672,7 @@ export class IosPreviewController {
     // Input can change the foreground app or the display state, and the shell doesn't announce those.
     this.wearRemote?.schedulePublish()
     if (!acceptInput(event)) return
+    if (headTilt && !this.glance.allowsHeadTilt()) return
     if (this.glassesLocked) {
       // Preserve the locked display's sleep/wake controls without dispatching
       // gestures to apps, shell menus, voice input or the Glanceboard.
@@ -658,6 +691,7 @@ export class IosPreviewController {
         return
       }
     }
+    if (headTilt && !shell.isScreenOn()) shell.wake('window')
     await shell.receiveInput(event)
     this.requestShellRender()
   }
@@ -836,7 +870,11 @@ export class IosPreviewController {
     if (this.state.phase !== 'connected') resetRingInputFilter()
     this.pushBrightness()
     this.maybeLaunchOnboarding(this.state)
-    if (this.state.phase !== 'connected' && this.state.phase !== 'connecting') this.glassesWorn = null
+    if (this.state.phase !== 'connected') {
+      this.glassesWorn = null
+      this.ringHoldActive = false
+      this.ringInputEpoch++
+    }
     // Unbound first, so a speech capture ending below doesn't hand the mic back to the dead session.
     this.syncRawMicSession()
     if (this.state.phase !== 'connected') iosVoiceInput.handleSessionEnded()
@@ -855,7 +893,7 @@ export class IosPreviewController {
       ring: connected ? this.state.ringBattery : null, ringCharging: connected ? this.state.ringCharging : null })
   }
   /** `fromBackground`: the watch asked, and the phone may be in a pocket with the app suspended. */
-  async connect(fromBackground = false): Promise<void> {
+  async connect(fromBackground = false, userInitiated = false): Promise<void> {
     if ((!this.active && !fromBackground) || this.connecting || this.stopping) return
     if (this.communicator && ['connecting', 'connected', 'retrying', 'disconnecting'].includes(this.state.phase)) return
     const addresses = loadDeviceAddresses(), error = deviceAddressError(addresses)
@@ -871,17 +909,15 @@ export class IosPreviewController {
         ringBattery: null, ringCharging: null }
       this.firmwareCompatible = false
       this.update('connecting', 'Finding configured devices…')
-      let identifiers
-      // As on Android, connect to the ring only in "Direct" mode; otherwise a phone-side connect
-      // fails and retries every few seconds, starving the glasses link.
-      const ring = ringConnectionModeSetting.get() === 'direct' ? addresses.ring : ''
-      try { identifiers = await resolveIosPeripherals({ ...addresses, ring }) }
-      catch (failure) {
-        this.update('error', failure instanceof Error ? failure.message : String(failure))
-        return
-      }
       if (this.communicator) await this.closeCommunicator()
-      const communicator = new FaceclawCommunicatorBridge({ ...identifiers, glassesType: glassesTypeSetting.get() })
+      const communicator = await ensureIosSession({ userInitiated, allowScan: this.active })
+      if (!communicator) { this.update('disconnected', 'Disconnected. Choose Connect to resume.'); return }
+      claimIosSessionForUi(communicator, () => {
+        if (this.communicator !== communicator) return
+        this.unbindCommunicator(communicator)
+        this.ensurePreviewDisplay()
+        this.update('disconnected', 'Connection changed. Choose Connect to resume.')
+      })
       this.teardownPreviewDisplay()
       this.communicator = communicator
       this.wearDetectionRequested = false
@@ -890,8 +926,11 @@ export class IosPreviewController {
       await this.displayReady
       this.update('connecting', 'Connecting to the glasses…')
       await communicator.configureBrightness(getBrightnessPreferences())
+      await communicator.setHeadUpEnabled(this.glance.allowsHeadTilt())
       this.startedCommunicators.add(communicator)
-      await communicator.start()
+      await communicator.promoteToInteractive()
+      if (communicator.isSessionReady()) this.handleSessionState(communicator, communicator.connectionState)
+      this.syncRingHealth(true)
       for (const window of shell.getWindows()) window.requestRender()
       this.requestShellRender()
     } catch (failure) {
@@ -931,6 +970,7 @@ export class IosPreviewController {
       }),
       communicator.onCaseState(state => {
         if (this.communicator !== communicator) return
+        if (state.docked && this.glassesWorn !== false) this.handleWearState(false)
         // As on Android: keep the last level when a reading has none (out of the case);
         // the case's own charging is only known while the glasses are docked.
         shell.setBatteryLevels({ ...(state.battery !== null ? { case: state.battery } : {}),
@@ -985,18 +1025,25 @@ export class IosPreviewController {
     // (or re-pairs / installs the custom firmware, which lift the suppression).
     if (isHaltedSessionPhase(state.phase)) suppressAutoReconnect()
     const phase: SessionPhase = state.phase === 'charging' ? 'connected' : isHaltedSessionPhase(state.phase) ? 'error' : state.phase
+    bindHeadUpSettingsSession(phase === 'connected' && glassesTypeSetting.get() === 'g2' ? communicator : null)
     // The relay ends with the link, so a reconnected session has to ask for it again (syncNotifications).
     if (phase !== 'connected' && this.notifications && this.notifications.state !== 'disconnected') this.notifications.stop()
     // Wear state is a per-transport snapshot: ask again on every new session.
     if (phase !== 'connected') this.wearDetectionRequested = false
+    const wasConnected = this.state.phase === 'connected'
     this.update(phase, state.status)
     if (phase === 'connected') {
       this.syncNotifications(communicator)
       this.ensureWearDetection(communicator)
+      if (!wasConnected) this.syncRingHealth(true)
     } else if ((phase === 'disconnected' || phase === 'error') && !this.stopping) {
       // The session ended on its own (an arm unpaired, incompatible firmware): release it and go headless.
       void this.disconnect(state.status)
     }
+  }
+  private syncRingHealth(collect = false): void {
+    void syncAutomaticR1Health().catch(() => this.logBluetooth('R1 health sync deferred; local records retained for retry.'))
+    if (collect) resumeIosRingHealth()
   }
   /**
    * Wear reports come from the custom firmware, so like Android only ask once the session
@@ -1008,11 +1055,20 @@ export class IosPreviewController {
     void communicator.enableWearDetectionAndRequestState().catch(error => this.logBluetooth(`Wear detection: ${String(error)}`))
   }
   private handleRingEvent(input: RawInputEvent): void {
+    const event = rawInputEventToInputEvent(input)
+    const inputEpoch = this.ringInputEpoch
+    const blockedAtArrival = input.eventSource === 2 && ringControlsOnlyWhileWornSetting.get() && this.glassesWorn !== true
     this.inputQueue = this.inputQueue.then(async () => {
       if (this.state.phase !== 'connected') return
+      if (blockedAtArrival || input.eventSource === 2 && ringControlsOnlyWhileWornSetting.get()
+        && (this.glassesWorn !== true || inputEpoch !== this.ringInputEpoch)) return
       this.onActivity()
       if (input.ringInput) this.state = { ...this.state, ring: true }
-      await this.receiveInput(rawInputEventToInputEvent(input),
+      if (input.eventSource === 2) {
+        if (event.type === 'long-press') this.ringHoldActive = true
+        else if (event.type === 'long-press-release') this.ringHoldActive = false
+      }
+      await this.receiveInput(event,
         input.kind === 'display-wake' && input.eventType === OsEventTypeList.HEAD_UP_EVENT)
       this.logBluetooth(`Input ${input.eventType} source ${input.eventSource}`)
     }).catch(error => this.fail(error))
@@ -1040,6 +1096,7 @@ export class IosPreviewController {
   }
   async disconnect(reason?: string): Promise<void> {
     if (this.stopping) return this.stopping
+    if (!reason) setIosSessionConnectionWanted(false)
     const communicator = this.communicator
     if (!communicator) return
     // Marked before any bridge call: the session may report "disconnected" from inside disconnect().
@@ -1054,7 +1111,6 @@ export class IosPreviewController {
       }
       if (this.state.phase === 'connected' || this.state.phase === 'connecting' || this.state.phase === 'retrying')
         this.update('disconnecting', 'Disconnecting…')
-      await communicator.disconnect().catch(error => this.logBluetooth(`Disconnect: ${String(error)}`))
     } finally {
       await this.closeCommunicator()
       this.ensurePreviewDisplay()
@@ -1066,14 +1122,19 @@ export class IosPreviewController {
   private async closeCommunicator(): Promise<void> {
     const communicator = this.communicator
     if (!communicator) return
+    this.unbindCommunicator(communicator)
+    await releaseIosSession(communicator).catch(error => this.logBluetooth(`Close: ${String(error)}`))
+  }
+  private unbindCommunicator(communicator: FaceclawCommunicatorBridge): void {
+    if (this.communicator !== communicator) return
     for (const off of this.sessionOffs.splice(0)) off()
     this.notifications = null
     this.communicator = null
     bindBandwidthBenchmarkSession(null)
+    bindHeadUpSettingsSession(null)
     // Releases an EvenHub app's mic before the session closes.
     this.syncRawMicSession()
     this.glance.reset()
-    await communicator.close().catch(error => this.logBluetooth(`Close: ${String(error)}`))
   }
   private maybeLaunchOnboarding(state: SessionState): void {
     const firstNewFrame = state.frames > this.acknowledgedFrames

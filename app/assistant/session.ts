@@ -5,6 +5,7 @@ import {
 } from "../prompts";
 import { assistantBridge } from "./bridge-client";
 import { DirectAssistantBackend } from "./direct-backend";
+import { healthDestinationForModel } from "./health-destination";
 import type { LlmMessage, LlmToolDefinition } from "./llm-protocol";
 import type { ResolvedAssistantModel } from "./models";
 import { toolRegistry, type ToolRegistry } from "./tool-registry";
@@ -22,8 +23,10 @@ export type AssistantSessionHistory = {
   transcript: AssistantTranscriptEntry[];
   /** Model identity for safe replay after Auto resolves differently on restart. */
   engine?: string;
-  /** The Hermes server-side session for this conversation (Hermes keeps the history). */
+  /** Stable server-side identity for this conversation. */
   hermesSessionId?: string;
+  /** Model destination that has received health-derived content in this conversation. */
+  healthDestination?: string;
 };
 
 /** Which engine answers utterances, plus what it needs to do so. */
@@ -55,9 +58,9 @@ export class AssistantSession {
   // API-safe tool name -> canonical registry name. Provider APIs restrict tool
   // names, so dotted registry names are sanitized and mapped back on calls.
   private readonly toolNameMap = new Map<string, string>();
-  // Saved with the history: Faceclaw only sends Hermes the latest message, so a
-  // restored conversation must keep addressing the same server-side session.
+  // Saved with the history so restored conversations keep their server-side identity.
   private readonly hermesSessionId: string;
+  private healthDestination: string | undefined;
 
   constructor(
     private config: AssistantBackendConfig,
@@ -67,6 +70,8 @@ export class AssistantSession {
     this.hermesSessionId = typeof history?.hermesSessionId === "string" && history.hermesSessionId
       ? history.hermesSessionId
       : `faceclaw-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+    this.healthDestination = typeof history?.healthDestination === "string" && history.healthDestination
+      ? history.healthDestination : undefined;
     if (history) {
       this.messages.push(...history.messages);
       this.transcript.push(...history.transcript);
@@ -86,7 +91,8 @@ export class AssistantSession {
   }
 
   history(): AssistantSessionHistory {
-    return { messages: this.messages, transcript: this.transcript, engine: this.engine(), hermesSessionId: this.hermesSessionId };
+    return { messages: this.messages, transcript: this.transcript, engine: this.engine(),
+      hermesSessionId: this.hermesSessionId, healthDestination: this.healthDestination };
   }
 
   configure(config: AssistantBackendConfig): void {
@@ -129,6 +135,12 @@ export class AssistantSession {
     }
     text = text.trim();
     if (!text) return;
+    const currentHealthDestination = this.config.kind === "direct"
+      ? healthDestinationForModel(this.config.llm) : null;
+    if (this.healthDestination && this.healthDestination !== currentHealthDestination) {
+      callbacks.onError("This conversation contains health data. Continue with its original assistant or start a new conversation.");
+      return;
+    }
     const generation = ++this.turnGeneration;
     const reply: AssistantTranscriptEntry = { role: "assistant", text: "" };
     this.transcript.push({ role: "user", text }, reply);
@@ -155,6 +167,11 @@ export class AssistantSession {
         this.status = `→ ${label}`;
         this.changed();
         callbacks.onToolActivity(label);
+      },
+      onQuestion: async (prompt) => {
+        if (generation !== this.turnGeneration || !callbacks.onQuestion) return null;
+        const answer = await callbacks.onQuestion(prompt);
+        return generation === this.turnGeneration ? answer : null;
       },
       onTurnDone: (result) => {
         if (generation !== this.turnGeneration) return;
@@ -206,6 +223,11 @@ export class AssistantSession {
       buildTools: () => this.buildToolDefinitions(),
       registry: this.registry,
       resolveToolName: (apiName) => this.toolNameMap.get(apiName) ?? apiName,
+      onToolResult: (name, result) => {
+        if (name !== "health.apple_summary" || !result.ok || !currentHealthDestination) return;
+        this.healthDestination = currentHealthDestination;
+        this.changed();
+      },
       callbacks: {
         ...wrappedCallbacks,
         onTurnDone: (result) => {

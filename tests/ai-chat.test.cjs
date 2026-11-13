@@ -11,6 +11,7 @@ function load(file, deps, globals = {}) {
   vm.runInNewContext(ts.transpileModule(source, {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 },
   }).outputText, { exports, console, setTimeout, clearTimeout, ...globals, require(name) {
+    if (name.endsWith('/health-destination')) return load('app/assistant/health-destination.ts', {}, { URL });
     assert.ok(name in deps, `Unexpected import ${name} in ${file}`);
     return deps[name];
   } });
@@ -279,6 +280,7 @@ function shellEnv({ wakeAction = 'voice-input', skipConfirmation = false } = {})
       startCapture() {}
       onRemoved() { this.options.onClosed(); }
     } }, './keyboard-input': {}, './voice-activity': { voiceActivity: { setActive() {} } }, './assistant': {},
+    './assistant-question': { AssistantQuestionLayer: class {}, isSupportedAssistantQuestionPrompt: () => false },
     '../../assistant/conversations': {}, '../../assistant/models': {}, '../../native/settings-store': {},
     '../notifications': {}, '../dashboard-settings': settings, './ambient-cards': {},
     './chrome-layer': { ShellChromeLayer: class {} }, './modal-layer': {}, './tool-debug-layer': {},

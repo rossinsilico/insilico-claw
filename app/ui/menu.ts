@@ -84,6 +84,14 @@ export type MenuItem = {
   disabled?: boolean | (() => boolean);
   onSelect: (ctx: LayerContext, menu: MenuLayer) => Promise<void> | void;
   render?: (args: MenuItemRenderArgs) => void;
+  /** Native phone companion rendering for the same canonical settings row. */
+  phone?:
+    | { kind: "setting"; setting: unknown; displayValue?: () => string }
+    | { kind: "submenu"; items: () => MenuItem[] }
+    | { kind: "font" | "notification-filter" | "model-discovery" | "remote-input" | "devices" }
+    | { kind: "head-up-angle" }
+    | { kind: "document"; fileName: string }
+    | { kind: "status"; value: () => string };
 };
 
 /**
@@ -170,7 +178,7 @@ export function drawSubmenuIndicator(
 export function submenuItem(
   label: string,
   onSelect: MenuItem["onSelect"],
-  options: Pick<MenuItem, "description" | "disabled"> = {},
+  options: Pick<MenuItem, "description" | "disabled" | "phone"> = {},
 ): MenuItem {
   return {
     ...options,

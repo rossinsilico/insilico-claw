@@ -59,9 +59,13 @@
 
 import {
   type HealthSample,
+  type R1SampleOrigin,
+  type R1SampleProvenance,
   type Rollup,
   type SampleMetric,
   type SleepSession,
+  type UnstoredSleepSession,
+  type UnstoredHealthSample,
   SAMPLE_METRICS,
   monthKey,
   rollupOf,
@@ -93,6 +97,7 @@ type SampleLine = {
   x: number;
   a: number;
   u: number;
+  p?: R1SampleProvenance;
 };
 
 type RollupFile = {
@@ -162,17 +167,19 @@ export class HealthStore {
    * So: do NOT add a second dedupe layer at a caller or in the file backend.
    * If the shard grows again, the value is changing and the question is why.
    */
-  ingestSamples(samples: readonly HealthSample[]): number {
+  ingestSamples(samples: readonly (HealthSample | UnstoredHealthSample)[]): number {
     const byShard = new Map<string, Map<string, HealthSample>>();
     for (const sample of samples) {
-      if (!Number.isFinite(sample.startMs) || sample.spanMs <= 0) continue;
+      if (!Number.isFinite(sample.startMs) || sample.spanMs < 0) continue;
+      if (sample.spanMs === 0 && sample.provenance?.dateSource !== "ring-latest") continue;
       const name = shardName(sample.startMs);
       const shard = this.loadShard(name);
       const key = sampleKey(sample);
       const pending = byShard.get(name) ?? new Map<string, HealthSample>();
       const existing = pending.get(key) ?? shard.get(key);
-      if (existing && sameSample(existing, sample)) continue;
-      pending.set(key, sample);
+      const stored = sampleForStorage(existing, sample);
+      if (existing && sameSample(existing, stored)) continue;
+      pending.set(key, stored);
       byShard.set(name, pending);
     }
     let written = 0;
@@ -202,7 +209,7 @@ export class HealthStore {
    * Deduped on the session's own start time, so a night re-delivered by a
    * later sync replaces rather than duplicates.
    */
-  ingestSleep(sessions: readonly SleepSession[]): number {
+  ingestSleep(sessions: readonly (SleepSession | UnstoredSleepSession)[]): number {
     const held = this.loadSleep().slice();
     const fresh: SleepSession[] = [];
     for (const session of sessions) {
@@ -210,13 +217,15 @@ export class HealthStore {
         (candidate) =>
           candidate.startMs === session.startMs && candidate.timeResolved === session.timeResolved,
       );
+      const existing = index >= 0 ? held[index] : undefined;
+      const stored = sleepForStorage(existing, session);
       if (index >= 0) {
-        if (JSON.stringify(held[index]) === JSON.stringify(session)) continue;
-        held[index] = session;
+        if (JSON.stringify(existing) === JSON.stringify(stored)) continue;
+        held[index] = stored;
       } else {
-        held.push(session);
+        held.push(stored);
       }
-      fresh.push(session);
+      fresh.push(stored);
     }
     if (fresh.length > 0) {
       this.backend.append(SLEEP_FILE, "\n" + fresh.map((s) => `${JSON.stringify(s)}\n`).join(""));
@@ -233,7 +242,20 @@ export class HealthStore {
     const out: HealthSample[] = [];
     for (const name of this.shardNamesInRange(startMs, endMs)) {
       for (const sample of this.loadShard(name).values()) {
-        if (sample.startMs >= startMs && sample.startMs < endMs) out.push(sample);
+        if (sample.spanMs > 0 && sample.startMs >= startMs && sample.startMs < endMs) out.push(sample);
+      }
+    }
+    out.sort((a, b) => a.startMs - b.startMs);
+    return out;
+  }
+
+  /** Genuine instantaneous ring readings in [startMs, endMs). */
+  readingsInRange(startMs: number, endMs: number): HealthSample[] {
+    const out: HealthSample[] = [];
+    for (const name of this.shardNamesInRange(startMs, endMs)) {
+      for (const sample of this.loadShard(name).values()) {
+        if (sample.spanMs === 0 && sample.provenance?.dateSource === "ring-latest" &&
+            sample.startMs >= startMs && sample.startMs < endMs) out.push(sample);
       }
     }
     out.sort((a, b) => a.startMs - b.startMs);
@@ -297,6 +319,7 @@ export class HealthStore {
     for (const name of this.backend.list()) {
       if (!name.startsWith(SAMPLE_PREFIX) || !name.endsWith(SAMPLE_SUFFIX)) continue;
       for (const sample of this.loadShard(name).values()) {
+        if (sample.spanMs === 0) continue;
         const key = dayKey(sample.startMs);
         let byMetric = perDay.get(key);
         if (!byMetric) {
@@ -320,7 +343,7 @@ export class HealthStore {
     this.persistRollups();
   }
 
-  private updateRollupsFor(samples: readonly HealthSample[]): void {
+  private updateRollupsFor(samples: readonly { startMs: number }[]): void {
     const file = this.loadRollups();
     const touched = new Set<string>();
     for (const sample of samples) touched.add(dayKey(sample.startMs));
@@ -418,8 +441,75 @@ export class HealthStore {
   }
 }
 
+function sleepForStorage(
+  existing: SleepSession | undefined,
+  incoming: SleepSession | UnstoredSleepSession,
+): SleepSession {
+  const origin = incoming.provenance as R1SampleOrigin | undefined;
+  if (existing?.provenance && !origin) return existing;
+  if (existing?.provenance && origin && existing.provenance.ringId !== origin.ringId) return existing;
+  if (!origin) return { ...incoming, provenance: undefined };
+  if (!existing?.provenance) {
+    return { ...incoming, provenance: { ...origin, exportRevision: 1 } };
+  }
+  const { provenance: _existingOrigin, ...existingValue } = existing;
+  const { provenance: _incomingOrigin, ...incomingValue } = incoming;
+  if (JSON.stringify(existingValue) === JSON.stringify(incomingValue)) return existing;
+  return {
+    ...incoming,
+    provenance: { ...origin, exportRevision: existing.provenance.exportRevision + 1 },
+  };
+}
+
 function sameSample(a: HealthSample, b: HealthSample): boolean {
+  return sameMeasurement(a, b) && JSON.stringify(a.provenance) === JSON.stringify(b.provenance);
+}
+
+function sameMeasurement(a: HealthSample, b: HealthSample | UnstoredHealthSample): boolean {
   return a.min === b.min && a.max === b.max && a.avg === b.avg && a.total === b.total;
+}
+
+function sampleForStorage(
+  existing: HealthSample | undefined,
+  incoming: HealthSample | UnstoredHealthSample,
+): HealthSample {
+  const origin = incoming.provenance as R1SampleOrigin | undefined;
+  // A journal replay cannot replace a verified measurement or reset its revision.
+  if (existing?.provenance && !origin) return existing;
+  // shortcut: keep the first ring's overlapping bucket, partition by ring before supporting multiple rings.
+  if (existing?.provenance && origin && existing.provenance.ringId !== origin.ringId) return existing;
+  if (!origin) {
+    return sameMeasurementIfPresent(existing, incoming)
+      ? { ...incoming, provenance: existing!.provenance }
+      : { ...incoming, provenance: undefined };
+  }
+  // A timestamp identifies one physical reading. Conflicting redeliveries stay
+  // in the native raw journal; never rewrite the first durable interpretation.
+  if (incoming.spanMs === 0 && existing) return existing;
+  if (!existing?.provenance || existing.provenance.ringId !== origin.ringId) {
+    return { ...incoming, provenance: { ...origin, exportRevision: 1 } };
+  }
+  const measurementSame = sameMeasurement(existing, incoming);
+  const existingComplete = sampleCompleteAt(existing, existing.provenance.receivedAtMs);
+  const incomingComplete = sampleCompleteAt(incoming, origin.receivedAtMs);
+  if (measurementSame && (existingComplete || existingComplete === incomingComplete)) {
+    return { ...incoming, provenance: existing.provenance };
+  }
+  return {
+    ...incoming,
+    provenance: { ...origin, exportRevision: existing.provenance.exportRevision + 1 },
+  };
+}
+
+function sameMeasurementIfPresent(
+  existing: HealthSample | undefined,
+  incoming: HealthSample | UnstoredHealthSample,
+): boolean {
+  return !!existing && sameMeasurement(existing, incoming);
+}
+
+function sampleCompleteAt(sample: HealthSample | UnstoredHealthSample, receivedAtMs: number): boolean {
+  return sample.startMs + sample.spanMs <= receivedAtMs;
 }
 
 function toLine(sample: HealthSample): SampleLine {
@@ -431,6 +521,7 @@ function toLine(sample: HealthSample): SampleLine {
     x: sample.max,
     a: sample.avg,
     u: sample.total,
+    p: sample.provenance,
   };
 }
 
@@ -446,6 +537,7 @@ function fromLine(line: string): HealthSample | null {
       max: parsed.x,
       avg: parsed.a,
       total: parsed.u,
+      provenance: parsed.p,
     };
   } catch {
     return null;

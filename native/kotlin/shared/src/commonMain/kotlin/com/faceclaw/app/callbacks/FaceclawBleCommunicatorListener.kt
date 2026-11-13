@@ -42,5 +42,15 @@ interface FaceclawBleCommunicatorListener {
 
     fun onFrameFinished(frameId: Int, outcome: String?): Unit
 
+    fun onRingHealthPullFinished(completed: Boolean, pages: Int, watermark: Long): Unit {}
+
+    fun onBackgroundRingHealthFinished(generation: Long, outcome: String, pages: Int, watermark: Long): Unit {}
+
+    fun onSessionRestored(restoredPeers: Int): Unit {}
+
+    fun onGlassesRingConnectionState(connected: Boolean, ringId: String): Unit {}
+
+    fun onPhoneRingReady(): Unit {}
+
     fun onFirmwareInfo(leftVersion: String?, rightVersion: String?, extension: String?): Unit
 }

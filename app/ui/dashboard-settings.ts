@@ -435,6 +435,15 @@ export const appSwitcherPositionSetting = new ConfigSettingEnum<AppSwitcherPosit
     "Where the open-app icons go. Left and right take a column beside windows; bottom puts a row beneath the window, which makes full-height windows a little shorter; popup shows them only while you're in the app switcher, in a box over the dimmed window. Bottom and popup leave room at the sides to set the display's depth. Open apps reopen at their new size when a change resizes windows.",
 });
 
+export const appSwitcherIncludeStatusBarSetting = new ConfigSettingBoolean({
+  id: "app-switcher-include-status-bar",
+  label: "Include status bar",
+  storageKey: "display.appSwitcherIncludeStatusBar",
+  defaultValue: false,
+  description:
+    "When on, app-switcher scrolling can visit notification icons and app widgets. Off keeps app-switcher scrolling within open apps; Notifications and Weather remain available as apps.",
+});
+
 /**
  * An enum setting that took over from older settings: until it is first
  * set, its value is derived from theirs.
@@ -663,6 +672,35 @@ export const wakeToLastAppSetting = new ConfigSettingBoolean({
   description: "Waking the display with a double tap returns to the app you were using. Off: wake into the app switcher.",
 });
 
+/** Master switch for the glasses' physical head-up gesture. */
+export const glanceShowOnHeadTiltSetting = new ConfigSettingBoolean({
+  id: "glanceboard-show-on-head-tilt",
+  label: "Head-up",
+  storageKey: "glanceboard.showOnHeadTilt",
+  defaultValue: true,
+  description: "Turn the display on when you tilt your head up. Double-tap wake is unchanged.",
+});
+
+export type HeadUpTarget = "glanceboard" | "last-app";
+
+class HeadUpTargetSetting extends ConfigSettingEnum<HeadUpTarget> {
+  get(): HeadUpTarget {
+    if (getStringSetting(this.storageKey, "") !== "") return super.get();
+    return this.set(getBooleanSetting("glanceboard.enabled", false) ? "glanceboard" : "last-app");
+  }
+}
+
+/** On first read, preserve whether the old Glanceboard master was enabled. */
+export const headUpTargetSetting = new HeadUpTargetSetting({
+  id: "head-up-target",
+  label: "Show",
+  storageKey: "display.headUpTarget",
+  defaultValue: "last-app",
+  values: ["glanceboard", "last-app"],
+  formatValue: (value) => value === "glanceboard" ? "Glanceboard" : "Last used app",
+  description: "What Head-up shows while the display is asleep.",
+});
+
 export const screenTimeoutSetting = new ConfigSettingEnum<ScreenTimeoutSetting>({
   id: "screen-timeout",
   label: "Screen timeout",
@@ -682,7 +720,7 @@ export const newNotificationDisplaySetting = new ConfigSettingEnum<NewNotificati
   formatValue: newNotificationDisplayLabel,
   description:
     "Pop up new phone notifications on the glasses. A timed popup closes once left untouched that long; " +
-    "the notification stays on the phone and in the status bar.",
+    "the notification stays on the phone and in the Notifications app. Status-bar icons follow each app's settings.",
 });
 
 /** Whether a newly posted phone notification from this app pops up on the glasses (the global setting, then the app's filter toggle). */
@@ -942,8 +980,20 @@ export const ringConnectionModeSetting = new ConfigSettingEnum<RingConnectionMod
   values: ["glasses", "health", "direct"],
   formatValue: (value) =>
     value === "direct" ? "Direct to phone" : value === "health" ? "Via glasses + health sync" : "Only via glasses",
+  description: global.isIOS
+    ? "Choose who handles R1 controls and health. Only via glasses: controls go through G2; Pilot has no R1 health link. Via glasses + health sync: controls still go through G2; health uses a separate R1-to-iPhone link. Direct to phone: iPhone handles both; health sync may briefly pause controls while R1 changes roles. Casing does not change the selected mode, and worn-only gates controls rather than health. Changes apply after reconnecting."
+    : "How the R1 ring reaches the phone. Only via glasses: the glasses relay the ring's gestures and the phone never connects to it. Via glasses + health sync: the same, plus the phone connects to the ring to sync health data. Direct to phone (experimental): the phone takes the ring over from the glasses and gets its gestures and battery itself; the glasses lose ring input. Health still syncs, but each sync (on opening Health, and at :01 and :31) pauses ring gestures for up to a minute while the phone briefly reconnects to the ring in its health role. Leaving Direct hands the ring back to the glasses. A RayNeo iO has no ring link of its own, so with one the phone always connects to the ring directly. Takes effect on the next connection to the glasses.",
+});
+
+export const ringControlsOnlyWhileWornSetting = new ConfigSettingBoolean({
+  id: "ring-controls-only-while-worn",
+  label: "Ring controls only while glasses are worn",
+  storageKey: "ring.controlsOnlyWhileWorn",
+  defaultValue: true,
+  formatValue: (value) => value ? "On" : "Off",
+  reportInAnalytics: false,
   description:
-    "How the R1 ring reaches the phone. Only via glasses: the glasses relay the ring's gestures and the phone never connects to it. Via glasses + health sync: the same, plus the phone connects to the ring to sync health data. Direct to phone (experimental): the phone takes the ring over from the glasses and gets its gestures and battery itself; the glasses lose ring input. Health still syncs, but each sync (on opening Health, and at :01 and :31) pauses ring gestures for up to a minute while the phone briefly reconnects to the ring in its health role. Leaving Direct hands the ring back to the glasses. A RayNeo iO has no ring link of its own, so with one the phone always connects to the ring directly. Takes effect on the next connection to the glasses.",
+    "Ignore ring gestures until wear detection confirms the glasses are on your head. The ring stays connected and health data can continue syncing.",
 });
 
 /**
@@ -1701,6 +1751,7 @@ export function enumSettingMenuItem<TValue extends string, TId extends string = 
   return {
     label,
     description: setting.description,
+    phone: { kind: "setting", setting },
     onSelect: (ctx) => {
       const current = setting.get();
       const items = setting.values.map((value): MenuItem => ({
@@ -1739,6 +1790,7 @@ export function toggleSettingMenuItem<TId extends string = string>(
   return {
     label,
     description: setting.description,
+    phone: { kind: "setting", setting },
     onSelect: (ctx) => {
       setting.set(!setting.get());
       opts?.onChange?.(ctx, setting.get(), !setting.get());
@@ -1755,6 +1807,7 @@ export function textSettingMenuItem<TId extends string = string>(
   return {
     label: setting.label,
     description: setting.description,
+    phone: { kind: "setting", setting },
     onSelect: (ctx: LayerContext) => {
       void ctx.actions.startTextSettingEdit(setting);
       ctx.stack.push(new EditTextSettingLayer(setting));

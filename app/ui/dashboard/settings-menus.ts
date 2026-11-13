@@ -28,6 +28,7 @@ import { drawRightValueMenuItem, openModalMenu, submenuItem, type MenuItem } fro
 import { shell } from "../shell/shell";
 import {
   anthropicApiKeySetting,
+  appSwitcherIncludeStatusBarSetting,
   appSwitcherPositionSetting,
   statusBarPositionSetting,
   statusBarVisibilitySetting,
@@ -77,6 +78,8 @@ import {
   screenFadeSetting,
   enumSettingMenuItem,
   firmwareDebugFlagsSetting,
+  glanceShowOnHeadTiltSetting,
+  headUpTargetSetting,
   lockScreenEnabledSetting,
   menuAnimationSetting,
   newNotificationDisplaySetting,
@@ -105,6 +108,7 @@ import { uiFontPickerMenuItem } from "../font-picker";
 import { NotificationFilterLayer } from "../notification-filter";
 import { compatibleModelDiscoveryMenuItem } from "../openai-compatible-model-picker";
 import { isVeniceApiBaseUrl } from "../../native/openai-chat";
+import { headUpAngleMenuItem } from "../head-up-settings";
 
 /** The Settings section the Notifications app's "Settings" menu item opens. */
 export const NOTIFICATIONS_SETTINGS_SECTION = "Notifications";
@@ -112,6 +116,11 @@ export const NOTIFICATIONS_SETTINGS_SECTION = "Notifications";
 /** The Settings app's master-detail panel (sections on the left, contents on the right). */
 export function createSettingsPanelLayer(): SettingsPanelLayer {
   return new SettingsPanelLayer(settingsSections());
+}
+
+/** The exact iOS glasses settings catalog, consumed by the native phone companion. */
+export function phoneSettingsSections(): SettingsSection[] {
+  return settingsSections();
 }
 
 function settingsSections(): SettingsSection[] {
@@ -131,6 +140,9 @@ function settingsSections(): SettingsSection[] {
         }),
         toggleSettingMenuItem(lockScreenEnabledSetting),
         toggleSettingMenuItem(wakeToLastAppSetting),
+        toggleSettingMenuItem(glanceShowOnHeadTiltSetting),
+        ...(global.isIOS ? [headUpAngleMenuItem()] : []),
+        enumSettingMenuItem(headUpTargetSetting),
         // A band (at one of five heights) / Tall / Full Screen; the
         // dashboard controller moves or reflows windows on change.
         enumSettingMenuItem(displayLayoutSetting),
@@ -179,12 +191,12 @@ function settingsSections(): SettingsSection[] {
           ...(selectedModel === "openai-compatible" ? [
             textSettingMenuItem(assistantOpenAiCompatibleUrlSetting),
             textSettingMenuItem(assistantOpenAiCompatibleKeySetting),
-            compatibleModelDiscoveryMenuItem({
+            { ...compatibleModelDiscoveryMenuItem({
               getBaseUrl: () => assistantOpenAiCompatibleUrlSetting.get(),
               getApiKey: () => assistantOpenAiCompatibleKeySetting.get(),
               getModel: () => assistantOpenAiCompatibleModelSetting.get(),
               setModel: (model) => assistantOpenAiCompatibleModelSetting.set(model),
-            }, assistantOpenAiCompatibleModelSetting),
+            }, assistantOpenAiCompatibleModelSetting), phone: { kind: "model-discovery" as const } },
             textSettingMenuItem(assistantOpenAiCompatibleModelSetting),
             ...(isVeniceApiBaseUrl(assistantOpenAiCompatibleUrlSetting.get())
               ? [toggleSettingMenuItem(veniceWebSearchSetting)] : []),
@@ -204,7 +216,7 @@ function settingsSections(): SettingsSection[] {
     {
       label: "API Keys",
       items: [
-        remoteInputMenuItem(),
+        { ...remoteInputMenuItem(), phone: { kind: "remote-input" as const } },
         textSettingMenuItem(elevenLabsApiKeySetting),
         textSettingMenuItem(openAiApiKeySetting),
         textSettingMenuItem(sonioxApiKeySetting),
@@ -279,6 +291,7 @@ function settingsSections(): SettingsSection[] {
         {
           label: "Disconnect from glasses",
           description: "Close the Bluetooth connection to the glasses and return them to standby.",
+          phone: { kind: "devices" },
           onSelect: async (ctx) => {
             ctx.stack.clearToBase();
             await ctx.actions.disconnect();
@@ -289,7 +302,7 @@ function settingsSections(): SettingsSection[] {
   ];
   if (!global.isIOS) return sections;
   return sections.map(section => {
-    if (section.label === "Developer") return { ...section, items: [enumSettingMenuItem(ringConnectionModeSetting),
+    if (section.label === "Developer") return { ...section, items: [ringConnectionMenuItem(),
       toggleSettingMenuItem(showBleBandwidthSetting)] };
     // No downloadable on-device models: iOS's on-device option is Apple's recognizer.
     if (section.label === "Voice") return { label: "Voice", items: [enumSettingMenuItem(wakeWordActionSetting),
@@ -307,10 +320,11 @@ function settingsSections(): SettingsSection[] {
  */
 function customizationRows(): () => MenuItem[] {
   // Opens the modal font picker (face, weight, size) for UI text.
-  const font = uiFontPickerMenuItem();
+  const font = { ...uiFontPickerMenuItem(), phone: { kind: "font" as const } };
   // Left / right / bottom edge, or popup; the dashboard controller moves or
   // resizes windows on change.
   const position = enumSettingMenuItem(appSwitcherPositionSetting);
+  const includeStatusBar = toggleSettingMenuItem(appSwitcherIncludeStatusBarSetting);
   // The whole display's stereo depth; the shell sends it with its scene.
   const depth = enumSettingMenuItem(uiDepthSetting);
   // Top bar, or the bottom: the right end of a bottom switcher's row, or a
@@ -333,9 +347,9 @@ function customizationRows(): () => MenuItem[] {
     // Miles or kilometers: Weather's wind speed and Navigate's distances.
     enumSettingMenuItem(distanceUnitSetting),
   ];
-  const bottomRows = [font, position, depth, statusBar, ...rest];
-  const popupRows = [font, position, depth, statusBar, statusBarVisibility, windowBorder, ...rest];
-  const sideRows = [font, position, ...rest];
+  const bottomRows = [font, position, includeStatusBar, depth, statusBar, ...rest];
+  const popupRows = [font, position, includeStatusBar, depth, statusBar, statusBarVisibility, windowBorder, ...rest];
+  const sideRows = [font, position, includeStatusBar, ...rest];
   return () => {
     switch (appSwitcherPositionSetting.get()) {
       case "bottom":
@@ -348,28 +362,31 @@ function customizationRows(): () => MenuItem[] {
   };
 }
 
-/** Notifications > Notification filter: per-app toggles for which notifications pop up. */
+/** Per-app popup and status-icon preferences; notification inventory stays available. */
 function notificationFilterMenuItem(): MenuItem {
   return submenuItem(
-    "Notification filter",
+    "App notifications",
     (ctx) => {
       ctx.stack.push(new NotificationFilterLayer());
     },
-    { description: "Choose which apps' new notifications pop up on the glasses. All of them still appear in the Notifications app." },
+    { description: "Choose popups and status-bar icons separately for each app. Notifications remain available in the Notifications app.",
+      phone: { kind: "notification-filter" } },
   );
 }
 
 function autoBrightnessMenuItem(): MenuItem {
+  const items = () => [
+    enumSettingMenuItem(autoBrightnessMinSetting),
+    enumSettingMenuItem(autoBrightnessMaxSetting),
+    textSettingMenuItem(autoBrightnessCurveSetting),
+  ];
   return submenuItem(
     "Auto-brightness",
     (ctx) => {
-      openSettingsSubMenu(ctx, "Auto-brightness", [
-        enumSettingMenuItem(autoBrightnessMinSetting),
-        enumSettingMenuItem(autoBrightnessMaxSetting),
-        textSettingMenuItem(autoBrightnessCurveSetting),
-      ]);
+      openSettingsSubMenu(ctx, "Auto-brightness", items());
     },
-    { description: "Adjust the minimum, maximum, and ambient-light curve used by Auto brightness." },
+    { description: "Adjust the minimum, maximum, and ambient-light curve used by Auto brightness.",
+      phone: { kind: "submenu", items } },
   );
 }
 
@@ -379,20 +396,21 @@ function autoBrightnessMenuItem(): MenuItem {
  * indicator is visible. The row itself shows the current style.
  */
 function batteryIndicatorsMenuItem(): MenuItem {
+  const items = () => [
+    enumSettingMenuItem(batteryDisplayModeSetting),
+    enumSettingMenuItem(phoneBatteryVisibilitySetting),
+    enumSettingMenuItem(watchBatteryVisibilitySetting),
+    enumSettingMenuItem(glassesBatteryVisibilitySetting, { label: glassesModelName() }),
+    enumSettingMenuItem(ringBatteryVisibilitySetting),
+  ];
   return {
     label: "Battery indicators",
     description:
       "Top-bar battery indicators for the phone, watch, glasses, and ring: their style, and whether each shows always, only when low, or never.",
     onSelect: (ctx) => {
-      openSettingsSubMenu(ctx, "Battery indicators", [
-        enumSettingMenuItem(batteryDisplayModeSetting),
-        enumSettingMenuItem(phoneBatteryVisibilitySetting),
-        enumSettingMenuItem(watchBatteryVisibilitySetting),
-        // Named as the top bar names this indicator.
-        enumSettingMenuItem(glassesBatteryVisibilitySetting, { label: glassesModelName() }),
-        enumSettingMenuItem(ringBatteryVisibilitySetting),
-      ]);
+      openSettingsSubMenu(ctx, "Battery indicators", items());
     },
+    phone: { kind: "submenu", items },
     render: ({ image, x, y, width }) => {
       drawRightValueMenuItem(
         image,
@@ -409,15 +427,14 @@ function batteryIndicatorsMenuItem(): MenuItem {
 
 /** The Customization section's "Animations" row: opens a modal submenu of animation speeds. */
 function animationsMenuItem(): MenuItem {
+  const items = () => [enumSettingMenuItem(menuAnimationSetting), enumSettingMenuItem(screenFadeSetting)];
   return submenuItem(
     "Animations",
     (ctx) => {
-      openSettingsSubMenu(ctx, "Animations", [
-        enumSettingMenuItem(menuAnimationSetting),
-        enumSettingMenuItem(screenFadeSetting),
-      ]);
+      openSettingsSubMenu(ctx, "Animations", items());
     },
-    { description: "Speed up, slow down, or turn off menu and icon-grid motion and the fade when the screen turns on and off." },
+    { description: "Speed up, slow down, or turn off menu and icon-grid motion and the fade when the screen turns on and off.",
+      phone: { kind: "submenu", items } },
   );
 }
 
@@ -465,6 +482,7 @@ function systemModelMenuItem(): MenuItem {
       "Faster and more private than the cloud models, but simpler, with a short memory. " +
       "Used automatically when no API key is set.",
     onSelect: () => {},
+    phone: { kind: "status", value: statusText },
     render: ({ image, x, y, width }) => {
       drawRightValueMenuItem(image, getDefaultSmallFont(), x, y, width, "On-phone model", statusText());
     },
@@ -606,6 +624,7 @@ function asrModelMenuItem(id: AsrModelId): MenuItem {
 function bundledDocMenuItem(fileName: string, label: string): MenuItem {
   return {
     label,
+    phone: { kind: "document", fileName },
     onSelect: (ctx) => {
       ctx.stack.push(new TextViewerLayer(readBundledDoc(fileName), label));
     },
@@ -632,6 +651,8 @@ function ringConnectionMenuItem(): MenuItem {
   return {
     ...item,
     disabled: io,
+    phone: { kind: "setting", setting: ringConnectionModeSetting,
+      displayValue: () => io() ? (glassesTypeSetting.get() === "g1" ? "Direct (Even G1)" : "Direct (RayNeo iO)") : ringConnectionModeSetting.displayValue() },
     render: (args) => {
       if (!io()) return item.render?.(args);
       drawRightValueMenuItem(args.image, getDefaultSmallFont(), args.x, args.y, args.width, item.label, glassesTypeSetting.get() === "g1" ? "Direct (Even G1)" : "Direct (RayNeo iO)");

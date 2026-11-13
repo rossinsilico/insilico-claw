@@ -4,6 +4,9 @@ package com.faceclaw.app
 
 import kotlin.concurrent.Volatile
 import platform.Foundation.NSBundle
+import platform.Foundation.NSApplicationSupportDirectory
+import platform.Foundation.NSSearchPathForDirectoriesInDomains
+import platform.Foundation.NSUserDomainMask
 import platform.Foundation.NSNotificationCenter
 import platform.Foundation.NSOperationQueue
 import platform.Foundation.NSThread
@@ -61,6 +64,18 @@ class IosSessionHost(private val platform: ProtocolPlatform = IosProtocolPlatfor
     }
 
     override fun isEvenAppActive(): Boolean = false
+
+    private val ringJournal by lazy {
+        val storage = NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory, NSUserDomainMask, true)
+            .firstOrNull() as? String ?: error("No private Application Support folder for ring health")
+        IosRingHealthJournal("$storage/health")
+    }
+
+    override fun supportsRingHealth(): Boolean = true
+
+    override fun ringHealthReadOnly(): Boolean = true
+
+    override fun appendRingFrameJournal(line: String) = ringJournal.append(line)
 
     override fun startWorker(body: () -> Unit) {
         val latch = Latch(1, platform)

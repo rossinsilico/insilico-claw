@@ -69,15 +69,21 @@ class IosGlassesSession internal constructor(
 
     companion object {
         const val TAG = GlassesSessionCore.TAG
+
+        fun decodeRingHealthJournal(text: String, afterReceivedAtMs: Long): String =
+            iosRingHealthJournalJson(text, afterReceivedAtMs)
     }
 
     private val frameTimings = IosFrameTimings.shared.core
     private val core = GlassesSessionCore(link, host, frameTimings, platform, rightAddress, leftAddress, ringAddress)
     private val rawQueue = dispatch_queue_create("com.faceclaw.session.raw", null)
     private val rightIdentifier = rightAddress.uppercase()
+    private val leftIdentifier = leftAddress.uppercase()
+    private val ringIdentifier = ringAddress.uppercase()
 
     init {
         central?.setSessionListener(core)
+        central?.setSessionRestorationListener { core.emitSessionRestored(it) }
     }
 
     // ----- lifecycle ------------------------------------------------------------------
@@ -86,10 +92,35 @@ class IosGlassesSession internal constructor(
 
     fun setRequiredFirmwareRevision(revision: Int) = core.setRequiredFirmwareRevision(revision)
 
+    fun setRingHealthIdentity(ringId: String) = core.setRingHealthIdentity(ringId)
+
     /** Drive an Even G1 on g1v0 (see GlassesSessionG1.kt). Before [start]. */
     fun useG1() = core.useG1()
 
     fun start(): Boolean = core.start()
+
+    fun startHealthOnly(): Boolean {
+        central?.setCachedConnectOnly(true)
+        return core.startHealthOnly()
+    }
+
+    fun promoteToInteractive(): Boolean {
+        central?.setCachedConnectOnly(false)
+        return core.promoteToInteractive()
+    }
+
+    fun configureStateRestoration(enabled: Boolean) {
+        central?.configureStateRestoration(
+            enabled,
+            setOf(rightIdentifier, leftIdentifier, ringIdentifier).filter { it.isNotEmpty() }.toSet(),
+            ringIdentifier,
+        )
+    }
+
+    fun setConnectionWanted(wanted: Boolean) {
+        if (!wanted) core.cancelRingBinding()
+        central?.setConnectionWanted(wanted)
+    }
 
     fun disconnect() = core.disconnect()
 
@@ -98,6 +129,51 @@ class IosGlassesSession internal constructor(
     fun onPhoneLockSignal() = core.onPhoneLockSignal()
 
     fun isSessionReady(): Boolean = core.isSessionReady()
+
+    fun setIndependentRingHealthEnabled(enabled: Boolean) = core.setIndependentRingHealthEnabled(enabled)
+
+    fun canSyncRingHealth(): Boolean = core.canSyncRingHealth()
+
+    fun requestBackgroundRingHealth(generation: Long, timeoutMs: Int): Boolean =
+        core.requestBackgroundRingHealth(generation, timeoutMs)
+
+    fun cancelBackgroundRingHealth(generation: Long): Boolean = core.cancelBackgroundRingHealth(generation)
+
+    fun prepareForRingRoleChange(timeoutMs: Int): Boolean = core.prepareForRingRoleChange(timeoutMs)
+
+    fun prepareForRingRoleChange(timeoutMs: Int, completion: (Boolean) -> Unit) {
+        core.cancelRingBinding()
+        dispatch_async(rawQueue) {
+            val result = runCatching { core.prepareForRingRoleChange(timeoutMs) }.getOrDefault(false)
+            dispatch_async(dispatch_get_main_queue()) { completion(result) }
+        }
+    }
+
+    fun bindRingToGlasses(
+        rightHardwareMac: String,
+        leftHardwareMac: String,
+        ringHardwareMac: String,
+        ringName: String,
+        timeoutMs: Int,
+        completion: (String) -> Unit,
+    ) {
+        val reservation = core.reserveRingBindingOperation(timeoutMs)
+        dispatch_async(rawQueue) {
+            val result = runCatching {
+                core.bindRingToGlassesOnWorker(
+                    rightHardwareMac,
+                    leftHardwareMac,
+                    ringHardwareMac,
+                    ringName,
+                    timeoutMs,
+                    reservation,
+                )
+            }.getOrDefault("failed: native error")
+            dispatch_async(dispatch_get_main_queue()) { completion(result) }
+        }
+    }
+
+    fun cancelRingBinding(): Boolean = core.cancelRingBinding()
 
     // ----- iPhone notification relay (ANCS) -------------------------------------------------
 
@@ -159,6 +235,23 @@ class IosGlassesSession internal constructor(
 
     fun setFaceclawWakeLeaseEnabled(enabled: Boolean): Boolean = core.setFaceclawWakeLeaseEnabled(enabled)
 
+    fun setHeadUpEnabled(enabled: Boolean) = core.setHeadUpEnabled(enabled)
+    fun readHeadUpAngle(completion: (Int) -> Unit) {
+        val sessionGeneration = core.captureHeadUpSessionGeneration()
+        dispatch_async(rawQueue) {
+            val result = core.readHeadUpAngleForSession(sessionGeneration)
+            dispatch_async(dispatch_get_main_queue()) { completion(result) }
+        }
+    }
+
+    fun setHeadUpAngle(angle: Int, completion: (Boolean) -> Unit) {
+        val sessionGeneration = core.captureHeadUpSessionGeneration()
+        dispatch_async(rawQueue) {
+            val result = core.setHeadUpAngleForSession(angle, sessionGeneration)
+            dispatch_async(dispatch_get_main_queue()) { completion(result) }
+        }
+    }
+
     fun awaitEvenHubSessionReady(timeoutMs: Int): Boolean = core.awaitEvenHubSessionReady(timeoutMs)
 
     fun setImuReportEnabled(enable: Boolean, reportFrq: Int) = core.setImuReportEnabled(enable, reportFrq)
@@ -183,6 +276,10 @@ class IosGlassesSession internal constructor(
 
     fun getBandwidthBenchmarkStatus(): String = core.getBandwidthBenchmarkStatus()
     fun getRingStatus(): String = core.getRingStatus()
+    fun takeRingHealthBatchJson(): String = iosRingHealthBatchJson(core.takeRingHealthBatch())
+    fun clearRingHealthRecordsBelow(watermark: Long): Int = core.clearRingHealthRecordsBelow(watermark)
+    fun requestRingHealthNow() = core.requestRingHealthNow()
+    fun requestRingHealthStartFresh(): Long = core.requestRingHealthStartFresh()
     fun setGlassesRingLink(action: String, fallbackAddress: String?, fallbackName: String?): Boolean =
         core.setGlassesRingLink(action, fallbackAddress, fallbackName)
     fun sendRingConfigCommand(action: String, fallbackAddress: String?, fallbackName: String?): String =

@@ -45,9 +45,15 @@ import {
   type WireStepsRecord,
 } from "./health-ingest";
 import { markLiveData, purgeFixtureData } from "./health-seed";
-import { checkedFileOperation, healthStore } from "./health-store-files";
-import { startOfLocalDay, type SleepSegment } from "./health-types";
-import { File, knownFolders } from "@nativescript/core";
+import { checkedFileOperation, healthFolder, healthStore } from "./health-store-files";
+import {
+  startOfLocalDay,
+  TEN_MINUTES_MS,
+  type SleepSegment,
+  type UnstoredHealthSample,
+} from "./health-types";
+import { isValidMacAddress, normalizeMacAddress } from "../g2/device-addresses";
+import { File } from "@nativescript/core";
 
 /** `RingProtocol.UNKNOWN_TIME` — the decoder's "I will not guess" sentinel. */
 const UNKNOWN_TIME = -1;
@@ -70,11 +76,14 @@ const HOURLY_METRIC: { [cmdHi: number]: WireHourlyRecord["metric"] } = {
 
 function activeCommunicator(): any {
   try {
+    if (isIos()) return require("../native/faceclaw-communicator.ios").FaceclawCommunicatorBridge.getActive();
     return (com as any).faceclaw.app.FaceclawBleCommunicator.getActive() ?? null;
   } catch {
     return null;
   }
 }
+
+function isIos(): boolean { return typeof global !== "undefined" && global.isIOS; }
 
 /**
  * Legacy compensation for the incorrect extra timezone shift sent by the
@@ -160,7 +169,7 @@ type LegacyStepBucketLedger = { dayStartMs: number; buckets: StepDayBuckets };
 const LEDGER_DAYS_KEPT = 7;
 
 function ledgerPath(): string {
-  return `${knownFolders.documents().getFolder("health").path}/steps-ledger.json`;
+  return `${healthFolder().path}/steps-ledger.json`;
 }
 
 function readLedger(): StepBucketLedger | null {
@@ -240,8 +249,112 @@ function accumulateStepBuckets(
   return merged;
 }
 
-function toWire(record: any): WireRecord | null {
+const EARLIEST_VERIFIED_HISTORY_MS = Date.UTC(2020, 0, 1);
+
+function freshOrigin(
+  ringId: string | undefined,
+  receivedAtMs: number,
+  dateSource: "ring-anchor" | "ring-sleep",
+): { kind: "r1-live"; ringId: string; receivedAtMs: number; dateSource: "ring-anchor" | "ring-sleep" } | undefined {
+  return ringId && isValidMacAddress(ringId) && Number.isFinite(receivedAtMs)
+    ? { kind: "r1-live", ringId, receivedAtMs, dateSource }
+    : undefined;
+}
+
+function iosActivityRecord(
+  record: any,
+  freshIosRingId: string | undefined,
+  freshNative: boolean,
+): WireRecord | null {
+  const receivedAtMs = Number(record.receivedAtMs);
+  const anchorSeconds = Number(record.anchorUnixSeconds);
+  if (!Number.isFinite(receivedAtMs) || !Number.isInteger(anchorSeconds)) return null;
+  const anchorMs = anchorSeconds * 1000;
+  if (anchorMs < EARLIEST_VERIFIED_HISTORY_MS || anchorMs > receivedAtMs) return null;
+  const provenance = freshOrigin(freshIosRingId, receivedAtMs, "ring-anchor");
+  if (freshNative && !provenance) return null;
+
+  const buckets: { index: number; steps: number; activeCalories: number; totalCalories: number }[] = [];
+  const raw = record.buckets;
+  if (!raw || typeof raw.length !== "number") return null;
+  for (let i = 0; i < raw.length; i++) {
+    const bucket = raw[i];
+    const index = Number(bucket.rowIndex ?? bucket.index);
+    const steps = Number(bucket.steps);
+    const activeRaw = Number(bucket.activeCalories ?? bucket.calorieLike2);
+    const totalRaw = Number(bucket.totalCalories ?? bucket.calorieLike3);
+    if (!Number.isInteger(index) || index < 0 || index > 143) return null;
+    if (!Number.isInteger(steps) || steps < 0 || steps > 0xffff) return null;
+    if (!Number.isFinite(activeRaw) || activeRaw < 0 || activeRaw > 0xffff) return null;
+    if (!Number.isFinite(totalRaw) || totalRaw < 0 || totalRaw > 0xffff) return null;
+    const endMs = anchorMs + (index + 1) * TEN_MINUTES_MS;
+    // A page can include the currently open slot and later preallocated rows.
+    // Preserve completed rows without promoting unfinished values to history.
+    if (endMs > receivedAtMs) continue;
+    buckets.push({
+      index,
+      steps,
+      activeCalories: Math.trunc(activeRaw),
+      totalCalories: Math.trunc(totalRaw),
+    });
+  }
+  return { kind: "steps", anchorMs, buckets, provenance };
+}
+
+function iosSleepRecord(
+  record: any,
+  freshIosRingId: string | undefined,
+  freshNative: boolean,
+): WireRecord | null {
+  if (Number(record.recordState) === SLEEP_STATE_EMPTY) return null;
+  const startTs = Number(record.startTs);
+  const endTs = Number(record.endTs);
+  const receivedAtMs = Number(record.receivedAtMs);
+  const totalSec = Number(record.totalTime);
+  const wakeSec = Number(record.wakeTime);
+  const remSec = Number(record.remTime);
+  const lightSec = Number(record.lightTime);
+  const deepSec = Number(record.deepTime);
+  const utcOffsetMinutes = Number(record.utcOffsetMinutes);
+  const temperatureValue = record.temperatureRaw == null ? 0 : Number(record.temperatureRaw);
+  if (![startTs, endTs, totalSec, wakeSec, remSec, lightSec, deepSec, utcOffsetMinutes]
+    .every(Number.isInteger)) return null;
+  if (!Number.isFinite(receivedAtMs) || startTs * 1000 < EARLIEST_VERIFIED_HISTORY_MS ||
+      startTs >= endTs || endTs * 1000 > receivedAtMs) return null;
+  if ([totalSec, wakeSec, remSec, lightSec, deepSec].some((value) => value < 0)) return null;
+  if (utcOffsetMinutes < -840 || utcOffsetMinutes > 840) return null;
+  if (!Number.isInteger(temperatureValue) || temperatureValue < 0 || temperatureValue > 0xffff) return null;
+  const segments: SleepSegment[] = [];
+  const stageSeconds = [0, 0, 0, 0];
+  const raw = record.segments;
+  if (!raw || typeof raw.length !== "number") return null;
+  for (let i = 0; i < raw.length; i++) {
+    const stageId = Number(raw[i].stage ?? raw[i].stageId);
+    const halfMinutes = Number(raw[i].halfMinutes);
+    if (!Number.isInteger(stageId) || stageId < 0 || stageId > 3 ||
+        !Number.isInteger(halfMinutes) || halfMinutes <= 0) return null;
+    segments.push({ stageId, halfMinutes });
+    stageSeconds[stageId]! += halfMinutes * 30;
+  }
+  const durationSec = endTs - startTs;
+  if (stageSeconds.reduce((sum, value) => sum + value, 0) !== durationSec ||
+      totalSec + wakeSec !== durationSec || remSec + lightSec + deepSec !== totalSec ||
+      stageSeconds[0] !== wakeSec || stageSeconds[1] !== remSec ||
+      stageSeconds[2] !== lightSec || stageSeconds[3] !== deepSec) return null;
+  const provenance = freshOrigin(freshIosRingId, receivedAtMs, "ring-sleep");
+  if (freshNative && !provenance) return null;
+  return {
+    kind: "sleep", startTs, endTs, clockCorrectionMs: 0,
+    totalSec, wakeSec, remSec, lightSec, deepSec, segments, receivedAtMs,
+    temperatureRaw: temperatureValue === 0 ? null : temperatureValue,
+    utcOffsetMinutes, provenance,
+  };
+}
+
+function toWire(record: any, freshIosRingId?: string, freshNative = false): WireRecord | null {
   const cmdHi = Number(record.cmdHi);
+  if (isIos() && cmdHi === CMD_STEPS) return iosActivityRecord(record, freshIosRingId, freshNative);
+  if (isIos() && cmdHi === CMD_SLEEP) return iosSleepRecord(record, freshIosRingId, freshNative);
 
   const metric = HOURLY_METRIC[cmdHi];
   if (metric) {
@@ -256,7 +369,17 @@ function toWire(record: any): WireRecord | null {
         min: Number(group.min),
       });
     }
-    return { kind: "hourly", metric, anchorMs: anchorToMs(Number(record.anchorUnixSeconds), true), groups };
+    const receivedAtMs = Number(record.receivedAtMs);
+    const provenance = freshIosRingId && Number.isFinite(receivedAtMs) ? {
+      kind: "r1-live" as const,
+      ringId: freshIosRingId,
+      receivedAtMs,
+      dateSource: "ring-anchor" as const,
+    } : undefined;
+    return {
+      kind: "hourly", metric, anchorMs: anchorToMs(Number(record.anchorUnixSeconds), !isIos()),
+      groups, provenance,
+    };
   }
 
   if (cmdHi === CMD_STEPS) {
@@ -343,6 +466,40 @@ function toWire(record: any): WireRecord | null {
   return null;
 }
 
+const EARLIEST_PLAUSIBLE_READING_MS = Date.UTC(2000, 0, 1);
+
+/** Preserve the native page's independently timestamped latest cache as a point. */
+function toLatestReading(record: any, freshIosRingId?: string): UnstoredHealthSample | null {
+  if (!freshIosRingId || !isValidMacAddress(freshIosRingId)) return null;
+  const metric = HOURLY_METRIC[Number(record.cmdHi)];
+  if (!metric) return null;
+  const tagSeconds = Number(record.tagRaw);
+  const value = Number(record.current);
+  const receivedAtMs = Number(record.receivedAtMs);
+  if (!Number.isInteger(tagSeconds) || !Number.isFinite(receivedAtMs)) return null;
+  const startMs = tagSeconds * 1000;
+  if (startMs < EARLIEST_PLAUSIBLE_READING_MS || startMs > receivedAtMs) return null;
+  const validValue = metric === "heartRate" ? Number.isInteger(value) && value >= 20 && value <= 300
+    : metric === "spo2" ? Number.isInteger(value) && value > 0 && value <= 100
+    : Number.isInteger(value) && value > 0 && value <= 0xffff;
+  if (!validValue) return null;
+  return {
+    metric,
+    startMs,
+    spanMs: 0,
+    min: value,
+    max: value,
+    avg: value,
+    total: value,
+    provenance: {
+      kind: "r1-live",
+      ringId: freshIosRingId,
+      receivedAtMs,
+      dateSource: "ring-latest",
+    },
+  };
+}
+
 export type LiveSyncResult = {
   /** Records the communicator was holding. 0 means no pull has landed yet. */
   seen: number;
@@ -384,6 +541,10 @@ function consumeUpTo(communicator: any, watermark: number): void {
 /** The communicator's `java.util.List` of `RingProtocol.HealthRecord`s. */
 type JavaRecordList = { size(): number; get(index: number): any };
 
+function recordList(records: any[] | JavaRecordList): JavaRecordList {
+  return Array.isArray(records) ? { size: () => records.length, get: (index) => records[index] } : records;
+}
+
 type StoreResult = Omit<LiveSyncResult, "seen">;
 
 /**
@@ -391,20 +552,27 @@ type StoreResult = Omit<LiveSyncResult, "seen">;
  * fails, so the caller keeps whatever it would otherwise mark as consumed.
  * Shared by the live batch and the journal replay.
  */
-function storeRecords(records: JavaRecordList): StoreResult {
+function storeRecords(records: JavaRecordList, freshIosRingId?: string, freshNative = false): StoreResult {
   const wire: WireRecord[] = [];
+  const latest: UnstoredHealthSample[] = [];
   const size = records.size();
   for (let i = 0; i < size; i++) {
     try {
-      const converted = toWire(records.get(i));
+      const record = records.get(i);
+      const ringId = freshNative ? freshIosRingId : isIos() && typeof record.ringId === "string" && isValidMacAddress(record.ringId)
+        ? normalizeMacAddress(record.ringId) : undefined;
+      const reading = toLatestReading(record, ringId);
+      if (reading) latest.push(reading);
+      const converted = toWire(record, ringId, freshNative || Boolean(ringId));
       if (converted) wire.push(converted);
     } catch (error) {
       console.warn("health live: skipped an undecodable record", error);
     }
   }
-  if (wire.length === 0) return { samplesWritten: 0, sleepWritten: 0, skipped: [] };
+  if (wire.length === 0 && latest.length === 0) return { samplesWritten: 0, sleepWritten: 0, skipped: [] };
 
   const { samples, sleep, skipped } = convertRecords(wire);
+  samples.push(...latest);
   if (samples.length === 0 && sleep.length === 0) {
     return { samplesWritten: 0, sleepWritten: 0, skipped };
   }
@@ -434,7 +602,7 @@ const JOURNAL_DECODER_VERSION = 2;
 type ReplayCursor = { version: number; throughReceivedAtMs: number };
 
 function healthFilePath(name: string): string {
-  return `${knownFolders.documents().getFolder("health").path}/${name}`;
+  return `${healthFolder().path}/${name}`;
 }
 
 function readReplayCursor(): ReplayCursor | null {
@@ -466,7 +634,9 @@ function replayFrameJournalOnce(): void {
   if (journalReplayed) return;
   let ringProtocol: any;
   try {
-    ringProtocol = (com as any).faceclaw.app.RingProtocol;
+    ringProtocol = isIos()
+      ? { decodeFrameJournal: require("../native/faceclaw-communicator.ios").FaceclawCommunicatorBridge.decodeRingHealthJournal }
+      : (com as any).faceclaw.app.RingProtocol;
   } catch {
     ringProtocol = null;
   }
@@ -476,15 +646,16 @@ function replayFrameJournalOnce(): void {
     return;
   }
   const cursor = readReplayCursor();
-  const after = cursor?.version === JOURNAL_DECODER_VERSION ? cursor.throughReceivedAtMs : 0;
-  const records: JavaRecordList = ringProtocol.decodeFrameJournal(File.fromPath(journalPath).readTextSync(), after);
+  // iOS receipt time can move backwards; replay once per launch and let the store dedupe.
+  const after = !isIos() && cursor?.version === JOURNAL_DECODER_VERSION ? cursor.throughReceivedAtMs : 0;
+  const records = recordList(ringProtocol.decodeFrameJournal(File.fromPath(journalPath).readTextSync(), after));
   const size = records.size();
   if (size > 0) {
     const result = storeRecords(records);
     let through = after;
     for (let i = 0; i < size; i++) through = Math.max(through, Number(records.get(i).receivedAtMs));
     const next: ReplayCursor = { version: JOURNAL_DECODER_VERSION, throughReceivedAtMs: through };
-    checkedFileOperation((onError) =>
+    if (!isIos()) checkedFileOperation((onError) =>
       File.fromPath(healthFilePath("journal-replay.json")).writeTextSync(JSON.stringify(next), onError),
     );
     console.log(
@@ -514,15 +685,18 @@ export function syncLiveRecords(): LiveSyncResult {
     return EMPTY;
   }
   if (!batch) return EMPTY;
-  const records = batch.getRecords();
+  const records = isIos() ? recordList(batch.records) : batch.getRecords();
   // Identifies exactly this snapshot. Anything the ring pushes from here on is
   // numbered above it and therefore cannot be cleared by this pass - which is
   // what keeps a page landing mid-ingest from being dropped.
-  const watermark = Number(batch.getWatermark());
+  const watermark = Number(isIos() ? batch.watermark : batch.getWatermark());
   if (!records || !records.size || records.size() === 0) return EMPTY;
   const size = records.size();
 
-  const { samplesWritten, sleepWritten, skipped } = storeRecords(records);
+  // Pending records belong to their producing session, never the current settings selection.
+  const ringId = isIos() && typeof batch.ringId === "string" && isValidMacAddress(batch.ringId)
+    ? normalizeMacAddress(batch.ringId) : "";
+  const { samplesWritten, sleepWritten, skipped } = storeRecords(records, ringId || undefined, true);
 
   // ONLY here. Both store writes have returned, so the records are durable.
   // If either threw, or the process died above this line, nothing is cleared

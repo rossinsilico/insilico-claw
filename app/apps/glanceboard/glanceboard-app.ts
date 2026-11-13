@@ -20,6 +20,7 @@ import {
   glanceLayoutSetting,
   glanceShowLinesSetting,
   glanceShowOnHeadTiltSetting,
+  headUpTargetSetting,
   glanceShowOnLongPressSetting,
   glanceSlotChoiceLabel,
   glanceSlotSettings,
@@ -312,6 +313,7 @@ function openGlanceSettings(ctx: LayerContext): void {
     enumSettingMenuItem(glanceTapDurationSetting),
     toggleSettingMenuItem(glanceShowOnLongPressSetting),
     toggleSettingMenuItem(glanceShowOnHeadTiltSetting),
+    enumSettingMenuItem(headUpTargetSetting),
     toggleSettingMenuItem(glanceShowLinesSetting),
     uiFontOverridePickerMenuItem(glanceFont, {
       title: "Glanceboard font",

@@ -11,8 +11,10 @@ import type {
   LlmToolDefinition,
 } from "./llm-protocol";
 import type { AssistantProvider } from "./models";
-import type { ToolRegistry } from "./tool-registry";
+import { healthDestinationForModel } from "./health-destination";
+import type { ToolCallSignal, ToolRegistry, ToolResult } from "./tool-registry";
 import type { AssistantTurnCallbacks, AssistantTurnHandle } from "./types";
+import type { OpenClawInputClient } from "./openclaw-input-client";
 
 /**
  * The on-phone agent loop: stream a reply, and while the model asks for tools,
@@ -33,6 +35,12 @@ const MAX_TURN_MS = 2 * 60 * 1000;
  * transports fail a stream that goes quiet for 180s.
  */
 const MAX_TURN_MS_HERMES = 20 * 60 * 1000;
+/** Agent-compatible servers may run multi-tool tasks; required input must fail fast server-side. */
+const MAX_TURN_MS_AGENT = 20 * 60 * 1000;
+
+function isOpenClawModel(model: string): boolean {
+  return model === "openclaw" || model.startsWith("openclaw/");
+}
 
 export type DirectTurnOptions = {
   provider: AssistantProvider;
@@ -56,27 +64,59 @@ export type DirectTurnOptions = {
   registry: ToolRegistry;
   /** Map an API tool name (as the model calls it) back to its registry name. */
   resolveToolName: (apiName: string) => string;
+  /** Called after a tool succeeds and before its result enters the next request. */
+  onToolResult?: (name: string, result: ToolResult) => void;
   callbacks: AssistantTurnCallbacks;
 };
+
+class TurnToolSignal implements ToolCallSignal {
+  private readonly listeners = new Set<() => void>();
+  aborted = false;
+
+  addEventListener(type: "abort", listener: () => void): void {
+    if (type !== "abort") return;
+    if (this.aborted) listener();
+    else this.listeners.add(listener);
+  }
+
+  removeEventListener(type: "abort", listener: () => void): void {
+    if (type === "abort") this.listeners.delete(listener);
+  }
+
+  abort(): void {
+    if (this.aborted) return;
+    this.aborted = true;
+    for (const listener of this.listeners) listener();
+    this.listeners.clear();
+  }
+}
 
 export class DirectAssistantBackend {
   runTurn(options: DirectTurnOptions): AssistantTurnHandle {
     const startMs = Date.now();
     let cancelled = false;
     let streamHandle: LlmStreamHandle | null = null;
+    let inputClient: OpenClawInputClient | null = null;
+    let inputConnectionId: string | undefined;
     let priorText = "";
     let deadline: ReturnType<typeof setTimeout> | null = null;
+    const toolSignal = new TurnToolSignal();
+    const healthDestination = healthDestinationForModel(options);
     const clearDeadline = () => { if (deadline !== null) clearTimeout(deadline); deadline = null; };
 
     const finishError = (message: string) => {
       if (cancelled) return;
       cancelled = true;
+      toolSignal.abort();
       clearDeadline(); streamHandle?.cancel(); streamHandle = null;
+      inputClient?.close();
       options.callbacks.onError(message);
     };
 
     const maxIterations = options.provider === "local" ? MAX_ITERATIONS_LOCAL : MAX_ITERATIONS;
-    const maxTurnMs = options.provider === "hermes" ? MAX_TURN_MS_HERMES : MAX_TURN_MS;
+    const maxTurnMs = options.provider === "hermes" ? MAX_TURN_MS_HERMES
+      : options.provider === "openai-compatible" && isOpenClawModel(options.model)
+        ? MAX_TURN_MS_AGENT : MAX_TURN_MS;
     const runIteration = (iteration: number): void => {
       if (cancelled) return;
       if (iteration >= maxIterations) {
@@ -103,6 +143,7 @@ export class DirectAssistantBackend {
         },
         onDone: (result) => {
           streamHandle = null;
+          inputClient?.endRun();
           if (cancelled) return;
           if (result.stopReason === "refusal") {
             finishError("The assistant declined this request");
@@ -123,10 +164,11 @@ export class DirectAssistantBackend {
           );
           if (result.stopReason !== "tool_use" || toolUses.length === 0) {
             clearDeadline();
+            inputClient?.close();
             options.callbacks.onTurnDone({ stopReason: result.stopReason });
             return;
           }
-          void this.runToolCalls(toolUses, options, () => cancelled)
+          void this.runToolCalls(toolUses, options, () => cancelled, toolSignal, healthDestination)
             .then((toolResults) => {
               // Always record the results, even if cancelled mid-flight: an
               // assistant tool_use with no matching tool_result would make the
@@ -148,7 +190,8 @@ export class DirectAssistantBackend {
         options.provider === "hermes"
           ? streamHermesChat({ ...streamOptions, baseUrl: options.baseUrl ?? "", sessionId: options.sessionId ?? "" })
           : options.provider === "openai-compatible"
-          ? streamOpenAiCompatibleChat({ ...streamOptions, baseUrl: options.baseUrl ?? "" })
+          ? streamOpenAiCompatibleChat({ ...streamOptions, baseUrl: options.baseUrl ?? "", user: options.sessionId,
+              inputConnectionId, onOpenClawRun: (runId, sessionKey, connId) => inputClient?.bindRun(runId, sessionKey, connId) })
           : options.provider === "openai"
           ? streamOpenAiResponse(streamOptions)
           : options.provider === "local"
@@ -157,14 +200,24 @@ export class DirectAssistantBackend {
     };
 
     deadline = setTimeout(() => finishError("Assistant stopped: turn took too long"), maxTurnMs);
-    runIteration(0);
+    if (typeof global !== "undefined" && global.isIOS && options.provider === "openai-compatible" && isOpenClawModel(options.model) && options.callbacks.onQuestion) {
+      void import("./openclaw-input-client").then(async ({ OpenClawInputClient }) => {
+        if (cancelled) return;
+        inputClient = new OpenClawInputClient({ baseUrl: options.baseUrl ?? "", apiKey: options.apiKey,
+          onQuestion: options.callbacks.onQuestion!, onError: finishError });
+        inputConnectionId = await inputClient.connect();
+        if (!cancelled) runIteration(0);
+      }).catch(error => finishError(String((error as Error).message)));
+    } else runIteration(0);
 
     return {
       cancel: () => {
         cancelled = true;
+        toolSignal.abort();
         clearDeadline();
         streamHandle?.cancel();
         streamHandle = null;
+        inputClient?.close();
       },
     };
   }
@@ -173,6 +226,8 @@ export class DirectAssistantBackend {
     toolUses: Array<Extract<LlmContentBlock, { type: "tool_use" }>>,
     options: DirectTurnOptions,
     isCancelled: () => boolean,
+    signal: ToolCallSignal,
+    healthDestination: string | null,
   ): Promise<LlmContentBlock[]> {
     const results: LlmContentBlock[] = [];
     for (const toolUse of toolUses) {
@@ -182,7 +237,11 @@ export class DirectAssistantBackend {
       }
       const canonicalName = options.resolveToolName(toolUse.name);
       options.callbacks.onToolActivity(canonicalName);
-      const result = await options.registry.callTool(canonicalName, toolUse.input);
+      const result = await options.registry.callTool(canonicalName, toolUse.input, {
+        healthDestination: healthDestination ?? undefined,
+        signal,
+      });
+      if (result.ok) options.onToolResult?.(canonicalName, result);
       const content = result.ok ? result.content ?? "" : result.error ?? "Tool error";
       results.push({
         type: "tool_result",

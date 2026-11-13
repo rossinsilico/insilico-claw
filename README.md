@@ -1,4 +1,19 @@
-# Faceclaw - An unofficial user interface for the Even Realities G2 smart glasses
+# Insilico Claw
+
+An iOS-focused companion-app fork of [FaceClaw](https://github.com/jimrandomh/faceclaw),
+maintained by [Ross](https://github.com/rossinsilico). Built on James Babcock's
+FaceClaw foundation, with the shared Android/iOS architecture and GPLv3 license
+preserved.
+
+This fork develops the iPhone interface, R1 health integration, notification
+controls, assistant connectivity and G2C experience. It continues to use
+FaceClaw's existing glasses firmware. See [fork status and development](FORK.md)
+for the current baseline, verification limits and contribution workflow.
+
+The documentation below is retained from upstream and describes upstream
+installation and features; it is not an announcement of a release from this fork.
+
+## Upstream FaceClaw documentation
 
 This is an unofficial user interface for the Even Realities G2 smart glasses.
 It is entirely unofficial, and comes with no support or warranty from Even

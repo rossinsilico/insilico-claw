@@ -1168,6 +1168,20 @@ function windowMenuItems(window: TerminalWindow): MenuItem[] {
           window.client.sendInput("\u001b");
         },
       },
+      {
+        label: "Send <Up>",
+        onSelect: (ctx) => {
+          ctx.stack.pop();
+          window.client.sendInput("\u001b[A");
+        },
+      },
+      {
+        label: "Send <Down>",
+        onSelect: (ctx) => {
+          ctx.stack.pop();
+          window.client.sendInput("\u001b[B");
+        },
+      },
     );
   }
   return items;

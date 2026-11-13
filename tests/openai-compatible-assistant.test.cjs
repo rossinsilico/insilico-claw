@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const { loader } = require('./helpers/load-typescript.cjs');
 const flush = () => new Promise(resolve => setImmediate(resolve));
 
-function assistant({ apiKey = 'fixture-key', baseUrl = 'https://provider.example/api/v1' } = {}) {
+function assistant({ apiKey = 'fixture-key', baseUrl = 'https://provider.example/api/v1', history } = {}) {
   const requests = [], calls = [], deltas = [], errors = [], done = [];
   const registry = {
     listTools: () => [
@@ -33,7 +33,7 @@ function assistant({ apiKey = 'fixture-key', baseUrl = 'https://provider.example
   const { AssistantSession } = load('app/assistant/session.ts');
   const session = new AssistantSession({ kind: 'direct', llm: {
     selection: 'openai-compatible', provider: 'openai-compatible', model: 'fixture-model', apiKey, baseUrl,
-  } }, registry);
+  } }, registry, history);
   const send = text => session.sendUtterance(text, {}, {
     onTextDelta: (_delta, full) => deltas.push(full),
     onToolActivity() {},
@@ -49,6 +49,63 @@ function assistant({ apiKey = 'fixture-key', baseUrl = 'https://provider.example
   };
   return { load, session, send, event, chunk, finish, requests, calls, deltas, errors, done };
 }
+
+test('compatible requests keep one user identity through callbacks and restore, while new conversations differ', async () => {
+  const h = assistant();
+  h.send('Set a timer');
+  const first = h.requests[0];
+  assert.match(first.body.user, /^faceclaw-/);
+  h.chunk(first, { tool_calls: [{ index: 0, id: 'call-1', function: { name: 'timer_set', arguments: '{"seconds":60}' } }] });
+  h.finish(first, 'tool_calls');
+  await flush();
+  assert.equal(h.requests[1].body.user, first.body.user, 'tool continuation stays in the conversation');
+  h.chunk(h.requests[1], { content: 'Done.' });
+  h.finish(h.requests[1]);
+
+  h.send('What did you do?');
+  const followUp = h.requests[2];
+  assert.equal(followUp.body.user, first.body.user, 'the next turn stays in the conversation');
+  assert.match(JSON.stringify(followUp.body.messages), /timer\.set completed/);
+  assert.match(JSON.stringify(followUp.body.messages), /Done\./);
+  h.chunk(followUp, { content: 'I set a timer.' });
+  h.finish(followUp);
+
+  const restored = assistant({ history: JSON.parse(JSON.stringify(h.session.history())) });
+  restored.send('What timer?');
+  assert.equal(restored.requests[0].body.user, first.body.user, 'restored conversation keeps its identity');
+  restored.session.cancel();
+
+  const fresh = assistant();
+  fresh.send('Hello');
+  assert.notEqual(fresh.requests[0].body.user, first.body.user, 'new conversation gets a new identity');
+  fresh.session.cancel();
+});
+
+test('capable OpenClaw stream binds only server-provided run metadata before content', () => {
+  const h = assistant();
+  const {streamOpenAiCompatibleChat} = h.load('app/native/openai-chat.ts');
+  const bindings = [], errors = [];
+  const handle = streamOpenAiCompatibleChat({apiKey:'fixture',baseUrl:'https://private.example/v1',model:'openclaw/main',messages:[],system:'',
+    inputConnectionId:'paired-connection', onOpenClawRun: (...args) => bindings.push(args),
+    onError: error=>errors.push(error), onDone() {}, onTextDelta() {}});
+  const req=h.requests[0];
+  assert.equal(req.headers['X-OpenClaw-Input-Connection'],'paired-connection');
+  h.event(req,{id:'run-1',openclaw:{sessionKey:'session-1',inputConnectionId:'paired-connection'},choices:[{delta:{role:'assistant'}}]});
+  assert.deepEqual(bindings,[['run-1','session-1','paired-connection']]);
+  h.event(req,{id:'run-2',choices:[{delta:{content:'wrong run'}}]});
+  assert.match(errors[0],/binding changed/);
+  handle.cancel();
+});
+
+test('capable OpenClaw stream refuses a server that omits the confirmation binding', () => {
+  const h=assistant();
+  const {streamOpenAiCompatibleChat}=h.load('app/native/openai-chat.ts');
+  const errors=[];
+  streamOpenAiCompatibleChat({apiKey:'fixture',baseUrl:'https://private.example/v1',model:'openclaw/main',messages:[],system:'',
+    inputConnectionId:'paired-connection',onOpenClawRun:()=>assert.fail('unverified binding'),onError:e=>errors.push(e),onDone(){},onTextDelta(){}});
+  h.event(h.requests[0],{id:'run-1',choices:[{delta:{role:'assistant'}}]});
+  assert.match(errors[0],/confirmation binding/);
+});
 
 test('compatible provider sends full history, nested tools, the exact API root and optional auth', () => {
   const h = assistant();
@@ -298,23 +355,31 @@ test('HTTP errors, malformed tool JSON and premature EOF never execute incomplet
   assert.match(h.errors.at(-1), /invalid API key/);
   assert.equal(h.session.isTurnActive(), false);
 
+  h.send('Needs consent');
+  h.requests[1].listener.onHttpError(403, JSON.stringify({ error: {
+    type: 'permission_error',
+    message: 'Input required. This HTTP client cannot answer native questions.\n\nAllow access to this conversation?\n\nThe request was not approved and this attempt was cancelled.',
+  } }));
+  assert.match(h.errors.at(-1), /Input required.*Allow access.*not approved and this attempt was cancelled/s);
+  assert.equal(h.session.isTurnActive(), false);
+
   h.send('Malformed');
-  h.chunk(h.requests[1], { tool_calls: [{ index: 0, id: 'bad', function: { name: 'timer_set', arguments: '{broken' } }] });
-  h.finish(h.requests[1], 'tool_calls');
+  h.chunk(h.requests[2], { tool_calls: [{ index: 0, id: 'bad', function: { name: 'timer_set', arguments: '{broken' } }] });
+  h.finish(h.requests[2], 'tool_calls');
   await flush();
   assert.match(h.errors.at(-1), /malformed tool arguments/);
   assert.equal(h.calls.length, 0);
 
   h.send('Truncated');
-  h.chunk(h.requests[2], { tool_calls: [{ index: 0, id: 'partial', function: { name: 'timer_set', arguments: '{"seconds":60}' } }] });
-  h.requests[2].listener.onComplete();
+  h.chunk(h.requests[3], { tool_calls: [{ index: 0, id: 'partial', function: { name: 'timer_set', arguments: '{"seconds":60}' } }] });
+  h.requests[3].listener.onComplete();
   await flush();
   assert.match(h.errors.at(-1), /before the response completed/);
   assert.equal(h.calls.length, 0);
 
   h.send('Length limited');
-  h.chunk(h.requests[3], { tool_calls: [{ index: 0, id: 'partial', function: { name: 'timer_set', arguments: '{"seconds":60}' } }] });
-  h.finish(h.requests[3], 'length');
+  h.chunk(h.requests[4], { tool_calls: [{ index: 0, id: 'partial', function: { name: 'timer_set', arguments: '{"seconds":60}' } }] });
+  h.finish(h.requests[4], 'length');
   await flush();
   assert.match(h.errors.at(-1), /before its tool calls completed/);
   assert.equal(h.calls.length, 0);

@@ -34,6 +34,7 @@ test('tray icons come from the source app, else its notification category, one p
   ]);
   const result = icons.readActiveNotificationIcons(10, false);
   assert.deepEqual([...result.keys], ['a', 'c', 'd', 'e']);
+  assert.deepEqual([...result.packageNames], ['net.whatsapp.WhatsApp', 'com.apple.mobilephone', 'com.apple.MobileSMS', 'com.example.tv']);
   assert.deepEqual([...result.icons].map(icon => iconName(pebble, icon)), ['whatsApp', 'missedCall', 'sms', 'tv']);
   assert.equal(icons.readActiveNotificationIcons(1, false).icons.length, 1);
 });

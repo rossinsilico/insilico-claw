@@ -101,7 +101,7 @@ test('unselected sidebar icons retain -2 depth through shell cropping, including
     '../../graphics/shell-scene':shellScene,'../../graphics/image':graphics,'../../graphics/display-list':require('../.test-build/app/graphics/display-list.js'),
     '../../graphics/ui-fonts':{getDefaultSmallFont:()=>font,getDefaultMediumFont:()=>font},
     '../../graphics/textwrap':{},'./ambient-cards':{},'../../graphics/battery':{},
-    '../../native/notification-icons':{},'../../native/notification-types':require('../.test-build/app/native/notification-types.js'),'../../native/phone-battery':{},'../../util/render-freshness':{},
+    '../../native/notification-icons':{},'../../native/notification-sources':{readNotificationSources:()=>[]},'../../native/notification-types':require('../.test-build/app/native/notification-types.js'),'../../native/phone-battery':{},'../../util/render-freshness':{},
     '../../graphics/icons':{},'../dashboard-settings':{},'../clock-format':{},'../../graphics/bdffont':{},
     '../layers':{LayerStack},'../menu':{scrollToKeepSelectionVisible:()=>0},'../metrics':{},
     './geometry':{MIN_WINDOW_HEIGHT:280,minWindowHeight:()=>280,screenWidth:()=>640,screenHeight:()=>480,minWindowTop:()=>0,windowTop:()=>0,SHELL_OPAQUE_BLACK:1,SIDEBAR_WIDTH:64,TOP_BAR_HEIGHT:24,
@@ -121,6 +121,8 @@ test('unselected sidebar icons retain -2 depth through shell cropping, including
 });
 test('shell modal carries its inner menu highlight animation instead of baking its first frame',async()=>{
   const {ShellModalLayer}=load('app/ui/shell/modal-layer.ts',{
+    '../../graphics/draw-expression':require('../.test-build/app/graphics/draw-expression.js'),
+    '../../graphics/display-list':require('../.test-build/app/graphics/display-list.js'),
     '../../graphics/image':graphics,'../../graphics/plane':planes,'../gestures':{},'../layers':load('app/ui/layers.ts',{
       '../graphics/image':graphics,'../graphics/plane':planes,'../native/frame-timings':{spanCurrent:(_name,fn)=>fn()},'../graphics/screen-size':{screenWidth:()=>640,screenHeight:()=>480},
       './gestures':{isDirectionalInput:()=>false},

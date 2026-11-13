@@ -11,15 +11,19 @@
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleDisplayName</key>
-  <string>Faceclaw</string>
+  <string>FaceClaw Pilot</string>
   <key>CFBundleShortVersionString</key>
   <string>0.9.0</string>
   <key>CFBundleVersion</key>
-  <string>1</string>
+	<string>35</string>
   <key>LSRequiresIPhoneOS</key>
   <true/>
   <key>NSBluetoothAlwaysUsageDescription</key>
   <string>Faceclaw uses Bluetooth to connect to your glasses and ring, display your apps, and receive gestures.</string>
+  <key>NSHealthShareUsageDescription</key>
+  <string>Pilot reads your recent steps, heart rate, resting heart rate, heart rate variability, and blood oxygen when you request a summary. Sharing a summary with your configured assistant requires a separate opt-in in Pilot.</string>
+  <key>NSHealthUpdateUsageDescription</key>
+  <string>Pilot saves verified, dated R1 heart rate, blood oxygen, steps, active energy, and sleep stages to Apple Health when you choose to export them.</string>
   <key>NSMicrophoneUsageDescription</key>
   <string>Faceclaw uses your phone microphone for voice input when your glasses are disconnected.</string>
   <key>NSSpeechRecognitionUsageDescription</key>
@@ -39,8 +43,11 @@
   <key>UIBackgroundModes</key>
   <array>
     <string>bluetooth-central</string>
+    <string>fetch</string>
     <string>location</string>
   </array>
+  <key>BGTaskSchedulerPermittedIdentifiers</key>
+  <array><string>com.rosspingatore.faceclawpilot.ring-health</string></array>
   <key>NSAppTransportSecurity</key>
   <dict>
     <key>NSAllowsLocalNetworking</key>

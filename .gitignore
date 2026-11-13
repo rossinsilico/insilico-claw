@@ -51,6 +51,7 @@ faceclaw_settings*.json
 # Developer configs
 build_paths.sh
 **/xcuserdata/
+.private-backups/
 
 # Kotlin build outputs and staged NativeScript artifacts
 native/kotlin/.gradle/

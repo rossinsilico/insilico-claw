@@ -32,7 +32,7 @@ function makeClock() {
 function makeTimeout(timeoutMs) {
   const clock = makeClock();
   let expiries = 0;
-  const timeout = new NotificationPopupTimeout(timeoutMs, () => { expiries++; }, clock.schedule);
+  const timeout = new NotificationPopupTimeout(timeoutMs, () => { expiries++; }, clock.schedule, () => clock.nowMs);
   return { clock, timeout, expiries: () => expiries };
 }
 
@@ -83,7 +83,7 @@ test("the expiry callback can restart the countdown (something was over the popu
   const timeout = new NotificationPopupTimeout(5_000, () => {
     expiries++;
     if (expiries === 1) timeout.restart();
-  }, clock.schedule);
+  }, clock.schedule, () => clock.nowMs);
   timeout.restart();
   clock.advance(5_000);
   assert.equal(expiries, 1);
@@ -91,4 +91,40 @@ test("the expiry callback can restart the countdown (something was over the popu
   clock.advance(5_000);
   assert.equal(expiries, 2);
   assert.equal(timeout.isRunning(), false);
+});
+
+test('a suspended host reconciles the deadline once without running its timer', () => {
+  const { clock, timeout, expiries } = makeTimeout(5000);
+  timeout.restart();
+  const first = timeout.presentation();
+  clock.nowMs = 4999;
+  assert.equal(timeout.reconcile(), false);
+  clock.nowMs = 5000;
+  assert.equal(timeout.reconcile(), true);
+  assert.equal(expiries(), 1);
+  assert.equal(timeout.presentation(), null);
+  assert.equal(timeout.reconcile(), false);
+  clock.advance(1000);
+  assert.equal(expiries(), 1);
+  assert.equal(first.durationMs, 5000);
+});
+
+test('interaction resets the retained timeline and covered popups resume with a fresh deadline', () => {
+  const { clock, timeout, expiries } = makeTimeout(5000);
+  timeout.restart();
+  const first = timeout.presentation();
+  clock.nowMs = 4000;
+  timeout.restart();
+  assert.notEqual(timeout.presentation().token, first.token);
+  assert.equal(timeout.presentation().startedAt, 4000);
+  timeout.setCovered(true);
+  clock.nowMs = 10000;
+  assert.equal(timeout.reconcile(), false);
+  assert.equal(timeout.presentation(), null);
+  timeout.setCovered(false);
+  assert.equal(timeout.presentation().startedAt, 10000);
+  clock.advance(4999);
+  assert.equal(expiries(), 0);
+  clock.advance(1);
+  assert.equal(expiries(), 1);
 });

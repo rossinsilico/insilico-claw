@@ -2,7 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { loader } = require('./helpers/load-typescript.cjs');
 
-function settingsEnv(initialUrl = '', initialModel = 'openai-compatible') {
+function settingsEnv(initialUrl = '', initialModel = 'openai-compatible', isIOS = false) {
   let url = initialUrl;
   let model = initialModel;
   let webSearch = false;
@@ -22,7 +22,14 @@ function settingsEnv(initialUrl = '', initialModel = 'openai-compatible') {
     set: value => { webSearch = value; }, toggle: () => { webSearch = !webSearch; },
     defaultValue: false, description: 'Venice-only web search.',
   };
-  const row = setting => ({ label: setting.label, description: setting.description, onSelect() {} });
+  const headUpSetting = { ...dummySetting, id: 'glanceboard-show-on-head-tilt', label: 'Head-up' };
+  const headUpTargetSetting = { ...dummySetting, id: 'head-up-target', label: 'Show' };
+  const appSwitcherPositionSetting = { ...dummySetting, id: 'app-switcher-position', label: 'App switcher position' };
+  const appSwitcherIncludeStatusBarSetting = {
+    ...dummySetting, id: 'app-switcher-include-status-bar', label: 'Include status bar', get: () => true,
+  };
+  const row = setting => ({ label: setting.label, description: setting.description, onSelect() {},
+    phone: { kind: 'setting', setting } });
   const dashboardSettings = new Proxy({
     assistantModelSetting: modelSetting,
     assistantOpenAiCompatibleUrlSetting: urlSetting,
@@ -31,6 +38,11 @@ function settingsEnv(initialUrl = '', initialModel = 'openai-compatible') {
     assistantHermesUrlSetting: { ...dummySetting, id: 'assistant-hermes-url', label: 'Hermes URL' },
     assistantHermesKeySetting: { ...dummySetting, id: 'assistant-hermes-key', label: 'Hermes key' },
     veniceWebSearchSetting: searchSetting,
+    glanceShowOnHeadTiltSetting: headUpSetting,
+    headUpTargetSetting,
+    appSwitcherPositionSetting,
+    appSwitcherIncludeStatusBarSetting,
+    glassesModelName: () => 'G2',
     enumSettingMenuItem: row,
     textSettingMenuItem: row,
     toggleSettingMenuItem: row,
@@ -39,7 +51,7 @@ function settingsEnv(initialUrl = '', initialModel = 'openai-compatible') {
       return property in target ? target[property] : dummySetting;
     },
   });
-  const load = loader({ global: { isIOS: false, isAndroid: true } }, {
+  const load = loader({ global: { isIOS, isAndroid: !isIOS } }, {
     './remote-input-menu': { remoteInputMenuItem: () => ({ label: 'Remote input' }) },
     '@nativescript/core': { knownFolders: {} },
     '../../graphics/ui-fonts': { getDefaultSmallFont: () => ({}) },
@@ -59,10 +71,11 @@ function settingsEnv(initialUrl = '', initialModel = 'openai-compatible') {
       asrModelState: () => ({}), cancelAsrModelDownload() {},
       deleteAsrModel() {}, startAsrModelDownload() {}, onAsrModelStateChanged: () => () => {},
     },
+    '../head-up-settings': { headUpAngleMenuItem: () => ({ label: 'Angle', onSelect() {}, phone: { kind: 'head-up-angle' } }) },
     '../../apps/files/text-viewer': { TextViewerLayer: class {} },
     '../menu': {
       drawRightValueMenuItem() {}, openModalMenu() {},
-      submenuItem: label => ({ label, onSelect() {} }),
+      submenuItem: (label, onSelect, options = {}) => ({ label, onSelect, ...options }),
     },
     '../shell/shell': { shell: { noteUserActivity() {} } },
     '../dashboard-settings': dashboardSettings,
@@ -78,7 +91,8 @@ function settingsEnv(initialUrl = '', initialModel = 'openai-compatible') {
     },
     './sse': {},
   });
-  const panel = load('app/ui/dashboard/settings-menus.ts').createSettingsPanelLayer();
+  const module = load('app/ui/dashboard/settings-menus.ts');
+  const panel = module.createSettingsPanelLayer();
   const section = panel.sections.find(item => item.label === 'Assistant');
   assert.ok(section);
   return {
@@ -87,8 +101,24 @@ function settingsEnv(initialUrl = '', initialModel = 'openai-compatible') {
     setUrl: value => { url = value; },
     setModel: value => { model = value; },
     searchSetting,
+    phoneSections: module.phoneSettingsSections,
+    display: panel.sections.find(item => item.label === 'Display'),
+    customization: panel.sections.find(item => item.label === 'Customization'),
+    headUpSetting,
+    headUpTargetSetting,
   };
 }
+
+test('app-switcher status navigation sits beside position in glasses and iOS phone settings', () => {
+  for (const isIOS of [false, true]) {
+    const env = settingsEnv('', 'openai-compatible', isIOS);
+    const items = env.customization.items;
+    const position = items.findIndex(item => item.label === 'App switcher position');
+    assert.equal(items[position + 1].label, 'Include status bar');
+    assert.equal(items[position + 1].phone.kind, 'setting');
+    assert.equal(items[position + 1].phone.setting.id, 'app-switcher-include-status-bar');
+  }
+});
 
 test('Venice web search row follows the current URL and never appears for other providers', () => {
   const env = settingsEnv();
@@ -147,4 +177,26 @@ test('OpenAI-compatible rows appear only while OpenAI-compatible is the selected
   ]));
   const labels = env.labels();
   assert.equal(labels.indexOf('Compatible API URL'), labels.indexOf('Assistant model') + 1, 'compatible rows follow the model row');
+});
+
+test('every iOS glasses settings row has a phone rendering descriptor', () => {
+  const env = settingsEnv('https://api.venice.ai/api/v1', 'openai-compatible', true);
+  const missing = [];
+  const visit = (section, items) => {
+    for (const item of items) {
+      if (!item.phone) missing.push(`${section}: ${item.label}`);
+      else if (item.phone.kind === 'submenu') visit(section, item.phone.items());
+    }
+  };
+  for (const section of env.phoneSections()) visit(section.label, section.items);
+  assert.deepEqual(missing, []);
+});
+
+test('Display exposes the canonical Head-up, Angle and Show controls in order', () => {
+  const env = settingsEnv('', 'auto', true);
+  const rows = env.display.items;
+  const start = rows.findIndex(item => item.label === 'Head-up');
+  assert.equal(JSON.stringify(rows.slice(start, start + 3).map(item => item.label)), JSON.stringify(['Head-up', 'Angle', 'Show']));
+  assert.equal(rows[start].phone.setting, env.headUpSetting);
+  assert.equal(rows[start + 2].phone.setting, env.headUpTargetSetting);
 });

@@ -70,6 +70,8 @@ export class RingStatusLayer implements Layer {
   private system: RingSystemBluetoothState | null = null;
   private timer: ReturnType<typeof setInterval> | null = null;
   private selected = 0;
+  private rowOffset = 0;
+  private maxRowOffset = 0;
   private notice = "";
 
   constructor(
@@ -97,7 +99,7 @@ export class RingStatusLayer implements Layer {
   private poll(): void {
     this.session = getRingSessionStatus();
     const address = this.ringAddress();
-    this.system = address ? getRingSystemBluetoothState(address) : null;
+    this.system = global.isAndroid && address ? getRingSystemBluetoothState(address) : null;
   }
 
   paint(ctx: LayerContext): GrayImage {
@@ -106,42 +108,47 @@ export class RingStatusLayer implements Layer {
     const image = new GrayImage(width, height, 0);
     const lineStep = font.lineHeight + 2;
     const buttonHeight = font.lineHeight + 8;
-    const buttonTop = height - buttonHeight - 6;
+    const buttonTop = global.isIOS ? height : height - buttonHeight - 6;
 
     image.drawText(font, 18, 10, "Ring status", 230);
     let y = 10 + lineStep + 4;
     const rows = this.rows();
     if (this.notice) rows.push({ label: "", value: this.notice });
-    for (const row of rows) {
+    if (global.isIOS) {
+      const visibleRows = Math.max(1, Math.floor((buttonTop - 4 - y - font.lineHeight) / lineStep) + 1);
+      this.maxRowOffset = Math.max(0, rows.length - visibleRows);
+      this.rowOffset = Math.min(this.rowOffset, this.maxRowOffset);
+    }
+    for (const row of global.isIOS ? rows.slice(this.rowOffset) : rows) {
       if (y + font.lineHeight > buttonTop - 4) break;
       image.drawText(font, LEFT_X, y, row.label, row.dim ? 100 : 150);
       image.drawText(font, VALUE_X, y, row.value, row.dim ? 120 : 220);
       y += lineStep;
     }
 
-    const buttonWidth = Math.floor((width - 2 * LEFT_X - BUTTON_GAP * (BUTTONS.length - 1)) / BUTTONS.length);
-    BUTTONS.forEach((button, index) => {
-      const x = LEFT_X + index * (buttonWidth + BUTTON_GAP);
-      const selected = index === this.selected;
-      if (selected) image.fillRoundedRect(x, buttonTop, buttonWidth, buttonHeight, 40, 4);
-      image.drawRoundedRect(x, buttonTop, buttonWidth, buttonHeight, selected ? 200 : 70, 4);
-      const text = buttonLabel(button);
-      image.drawText(font, x + Math.max(0, Math.floor((buttonWidth - font.measureText(text)) / 2)),
-        buttonTop + 4, text, selected ? 255 : 170);
-    });
+    if (!global.isIOS) {
+      const buttonWidth = Math.floor((width - 2 * LEFT_X - BUTTON_GAP * (BUTTONS.length - 1)) / BUTTONS.length);
+      BUTTONS.forEach((button, index) => {
+        const x = LEFT_X + index * (buttonWidth + BUTTON_GAP);
+        const selected = index === this.selected;
+        if (selected) image.fillRoundedRect(x, buttonTop, buttonWidth, buttonHeight, 40, 4);
+        image.drawRoundedRect(x, buttonTop, buttonWidth, buttonHeight, selected ? 200 : 70, 4);
+        const text = buttonLabel(button);
+        image.drawText(font, x + Math.max(0, Math.floor((buttonWidth - font.measureText(text)) / 2)),
+          buttonTop + 4, text, selected ? 255 : 170);
+      });
+    }
     return image;
   }
 
   private rows(): Row[] {
     const s = this.session;
     const address = this.ringAddress();
-    const rows: Row[] = [
-      { label: "Ring", value: address || "none paired" },
-      { label: "Phone BT", value: describeSystem(this.system) },
-    ];
+    const rows: Row[] = [{ label: "Ring", value: address || "none paired" }];
+    if (global.isAndroid) rows.push({ label: "Phone BT", value: describeSystem(this.system) });
 
     if (!s) {
-      rows.push({ label: "Session", value: "not connected to glasses", dim: true });
+      rows.push({ label: "Session", value: global.isIOS ? "status unavailable" : "not connected to glasses", dim: true });
       return rows;
     }
 
@@ -204,6 +211,7 @@ export class RingStatusLayer implements Layer {
   }
 
   private activate(ctx: LayerContext): void {
+    if (global.isIOS) return;
     switch (BUTTONS[this.selected]!) {
       case "glasses":
         ctx.stack.push(this.actionMenu("Glasses ring link", GLASSES_ACTIONS.map(({ label, action }) => ({
@@ -244,6 +252,12 @@ export class RingStatusLayer implements Layer {
   }
 
   handleInput(event: InputEvent, ctx: LayerContext): void {
+    if (global.isIOS) {
+      if (event.type === "scroll-up") this.rowOffset = Math.max(0, this.rowOffset - 1);
+      else if (event.type === "scroll-down") this.rowOffset = Math.min(this.maxRowOffset, this.rowOffset + 1);
+      else if (event.type === "double-click") ctx.stack.pop();
+      return;
+    }
     switch (event.type) {
       case "scroll-up":
         this.selected = (this.selected + BUTTONS.length - 1) % BUTTONS.length;

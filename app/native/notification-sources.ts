@@ -6,6 +6,7 @@ export type NotificationSource = {
   packageName: string;
   appName: string;
   showOnGlasses: boolean;
+  showStatusIcon: boolean;
 };
 
 /** Sources outlive their active notifications so a muted app can always be re-enabled. */
@@ -18,6 +19,7 @@ export function readNotificationSources(): NotificationSource[] {
         packageName: source.packageName,
         appName: typeof source.appName === "string" && source.appName ? source.appName : source.packageName,
         showOnGlasses: source.showOnGlasses !== false,
+        showStatusIcon: source.showStatusIcon !== false,
       }));
   } catch {
     return [];
@@ -36,6 +38,7 @@ export function rememberNotificationSources(notifications: { packageName: string
         packageName: notification.packageName,
         appName,
         showOnGlasses: previous?.showOnGlasses ?? true,
+        showStatusIcon: previous?.showStatusIcon ?? true,
       });
       changed = true;
     }
@@ -47,6 +50,10 @@ export function shouldShowNotificationOnGlasses(packageName: string): boolean {
   return readNotificationSources().find((source) => source.packageName === packageName)?.showOnGlasses ?? true;
 }
 
+export function shouldShowNotificationStatusIcon(packageName: string): boolean {
+  return readNotificationSources().find((source) => source.packageName === packageName)?.showStatusIcon ?? true;
+}
+
 export function setNotificationSourceEnabled(source: { packageName: string; appName: string }, enabled: boolean): void {
   if (!source.packageName) return;
   const sources = new Map(readNotificationSources().map((item) => [item.packageName, item]));
@@ -54,6 +61,19 @@ export function setNotificationSourceEnabled(source: { packageName: string; appN
     packageName: source.packageName,
     appName: source.appName || source.packageName,
     showOnGlasses: enabled,
+    showStatusIcon: sources.get(source.packageName)?.showStatusIcon ?? true,
+  });
+  setStringSetting(SOURCES_KEY, JSON.stringify(Array.from(sources.values())));
+}
+
+export function setNotificationSourceStatusIconEnabled(source: { packageName: string; appName: string }, enabled: boolean): void {
+  if (!source.packageName) return;
+  const sources = new Map(readNotificationSources().map((item) => [item.packageName, item]));
+  sources.set(source.packageName, {
+    packageName: source.packageName,
+    appName: source.appName || source.packageName,
+    showOnGlasses: sources.get(source.packageName)?.showOnGlasses ?? true,
+    showStatusIcon: enabled,
   });
   setStringSetting(SOURCES_KEY, JSON.stringify(Array.from(sources.values())));
 }

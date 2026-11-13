@@ -58,6 +58,7 @@ test('press is observed before routing and does not wake, operate shell menus or
     const unsubscribe = monitor.addInputListener((e) => seen.push(e));
     Object.assign(s, { screenOn, focus, stack: { isAtBase: () => atBase },
       foregroundWindow: () => ({ handleInput(e) { assert.equal(seen.length, 1); delivered.push(e); } }),
+      reconcileNotificationPopup: () => false,
       syncInputFocus() {}, lastInput: event('long-press'), lastInputAtMs: 123 });
     try {
       const result = await s.receiveInput(event('ring-press'));
@@ -164,6 +165,7 @@ test('raw debug observer sees suppressed reports once before app routing', async
   monitor.resetRingInputFilter();
   const { exports: { Shell } } = shellDeclarations(), s = new Shell(), seen = [], routed = [];
   s.routeInput = async (e) => { routed.push(e); return { shell:false,window:true }; };
+  s.reconcileNotificationPopup = () => false;
   s.syncInputFocus = () => {};
   const off = monitor.addInputListener((e, filtered) => seen.push([e, filtered]));
   try {

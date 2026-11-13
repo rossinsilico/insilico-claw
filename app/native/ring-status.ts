@@ -90,6 +90,14 @@ export type RingSystemBluetoothState = {
 };
 
 function activeCommunicator(): any {
+  if (global.isIOS) {
+    try {
+      const { FaceclawCommunicatorBridge } = require("./faceclaw-communicator.ios") as typeof import("./faceclaw-communicator.ios");
+      return FaceclawCommunicatorBridge.getActive();
+    } catch {
+      return null;
+    }
+  }
   if (!global.isAndroid) return null;
   try {
     return com.faceclaw.app.FaceclawBleCommunicator.getActive();
@@ -98,7 +106,7 @@ function activeCommunicator(): any {
   }
 }
 
-/** Null when there is no active glasses session (or on iOS). */
+/** Null when there is no active glasses session or the platform facade lacks the status export. */
 export function getRingSessionStatus(): RingSessionStatus | null {
   const active = activeCommunicator();
   if (!active) return null;
@@ -125,6 +133,7 @@ export function getRingSystemBluetoothState(address: string): RingSystemBluetoot
 
 /** False when there is no session or the command could not be queued. */
 export function setGlassesRingLink(action: GlassesRingLinkAction, fallbackAddress: string, fallbackName: string): boolean {
+  if (!global.isAndroid) return false;
   const active = activeCommunicator();
   if (!active) return false;
   try {
@@ -137,6 +146,7 @@ export function setGlassesRingLink(action: GlassesRingLinkAction, fallbackAddres
 
 /** A one-line outcome for the UI. */
 export function sendRingConfigCommand(action: RingConfigAction, fallbackAddress: string, fallbackName: string): string {
+  if (!global.isAndroid) return "not sent: unsupported on this platform";
   const active = activeCommunicator();
   if (!active) return "not sent: no glasses session";
   try {

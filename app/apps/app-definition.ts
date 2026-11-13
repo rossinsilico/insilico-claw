@@ -59,8 +59,10 @@ export type GlanceboardProvider = {
   tapTimeoutMs: () => number;
   /** Whether a long-press holds the board up until released. */
   showOnLongPress: () => boolean;
-  /** Whether the head-tilt wake goes to the board rather than the regular UI. */
+  /** Whether head-up may activate the board or wake the regular UI. */
   showOnHeadTilt: () => boolean;
+  /** Which surface head-up should show. */
+  headUpTarget: () => "glanceboard" | "last-app";
   /** Stereo depth (firmware units; positive is nearer) while the board covers the screen. */
   depth: () => number;
   /** A fresh board; requestRender asks the host to repaint it. */

@@ -507,10 +507,12 @@ test('the assistant offers Spotify search-and-play once signed in and refreshes 
   const registered = new Map(); const systemTools = new Map();
   const { registerSystemTools } = load('app/assistant/system-tools.ts', {
     '../native/calendar': {}, '../native/calendar-permissions': {},
+    '../native/location': { getCurrentLocation: async () => ({}) },
     '../native/media-controller': { mediaControllerBridge: { start: async () => {}, refresh: async () => refreshes.push('refresh'),
       snapshot: () => ({ accessEnabled: true, playbackState: 'playing', title: 'Song', artist: 'Band', appName: 'Spotify' }) } },
     '../native/spotify': { spotifyService: () => spotify },
     '../native/notification-icons': {}, '../ui/shell/shell': {}, './tool-registry': {},
+    './health-tools': { registerHealthTools() {} },
   }, { global: { isIOS: true } });
   registerSystemTools({
     registerSystemTool: (definition, handler) => systemTools.set(definition.name, handler),

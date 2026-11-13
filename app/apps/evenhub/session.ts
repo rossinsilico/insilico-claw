@@ -82,6 +82,7 @@ import {
 import { parseWindowIcon, WindowIconRenderer } from "./window-icon";
 import { availableFontFamilies, containerFace, measureContainerText } from "./fonts";
 import { parseFontSpec } from "./font-spec";
+import { onUiFontChanged } from "../../graphics/ui-fonts";
 
 
 /**
@@ -377,12 +378,14 @@ export function buildFaceclawExtensionsScript(versionString: string): string {
     returnToAppSwitcher: function () { send("returnToAppSwitcher"); },
     quit: function () { send("quit"); },
     addWindowLifecycleListener: function (cb) { return on("windowLifecycle", cb); },
+    getViewport: function () { return call("getViewport"); },
+    addViewportListener: function (cb) { return on("viewport", cb); },
     getConfiguredApiKeys: function () { return call("getConfiguredApiKeys"); },
     requestApiKeyAccess: function (services) { return call("requestApiKeyAccess", [services || []]); },
     playBuzzer: function (steps) { return call("playBuzzer", [steps || []]); },
     addCompassListener: counted("compass", "setCompass"),
-    createLayout: function (layout) { return call("createLayout", [layout || {}]); },
-    replaceLayout: function (layout) { return call("replaceLayout", [layout || {}]); },
+    createLayout: function (layout, options) { return call("createLayout", [layout || {}, options || {}]); },
+    replaceLayout: function (layout, options) { return call("replaceLayout", [layout || {}, options || {}]); },
     setAssistantTools: setAssistantTools,
     addTouchDownListener: counted("touchDown", "setTouchDown"),
     addTextInputListener: counted("textInput", "setTextInput"),
@@ -391,7 +394,12 @@ export function buildFaceclawExtensionsScript(versionString: string): string {
     setAttention: function (attention) { send("setAttention", [!!attention]); },
     setKeepScreenOn: function (keepOn) { send("setKeepScreenOn", [!!keepOn]); },
     getFonts: function () { return call("getFonts"); },
-    measureText: function (text, font) { return call("measureText", [String(text), font || null]); }
+    measureText: function (text, font, options) {
+      var args = [String(text), font || null];
+      if (options) args.push(options);
+      return call("measureText", args);
+    },
+    addTypographyListener: function (cb) { return on("typography", cb); }
   };
   window.getFaceclawExtensions = function () { return extensions; };
 })();
@@ -417,6 +425,8 @@ export type EvenHubWindowHooks = {
   pushOverlay: (layer: Layer) => void;
   /** Switch the window between the stock 576x288 band and the full 576x452 canvas. */
   setTallCanvas: (tall: boolean) => void;
+  /** Current app-content viewport after shell chrome and display layout. */
+  getViewport: () => { width: number; height: number };
   /** Show or clear the attention dot on the window's switcher icon. */
   setAttention: (attention: boolean) => void;
   /** Offer (or stop offering) the window as the shell's "Type Into App" destination. */
@@ -445,6 +455,7 @@ export class EvenHubSession implements EvenHubMicClient, EvenHubImuClient, EvenH
   private extendedLayout = false;
   private webViewHandle: EvenHubWebViewHandle | null = null;
   private windowHooks: EvenHubWindowHooks | null = null;
+  private lastViewport: { width: number; height: number } | null = null;
   private closed = false;
   private launchContextPushed = false;
   private loadError = '';
@@ -492,6 +503,7 @@ export class EvenHubSession implements EvenHubMicClient, EvenHubImuClient, EvenH
   /** The last deviceStatusChanged sent, and the subscriptions that refresh it. */
   private lastDeviceStatus: EvenHubDeviceStatus | null = null;
   private readonly deviceStatusOffs: (() => void)[] = [];
+  private readonly uiFontOff: () => void;
   private log: (message: string) => void;
 
   constructor(
@@ -506,6 +518,14 @@ export class EvenHubSession implements EvenHubMicClient, EvenHubImuClient, EvenH
     this.distDir = distDir;
     this.remoteUrl = remoteUrl;
     this.log = log;
+    this.uiFontOff = onUiFontChanged(() => {
+      const measurement = measureContainerText("", undefined);
+      this.pushExtEvent("typography", {
+        revision: measurement.revision,
+        lineHeight: measurement.lineHeight,
+      });
+      this.windowHooks?.requestRender();
+    });
   }
 
   // ----- webview wiring -----
@@ -543,10 +563,24 @@ export class EvenHubSession implements EvenHubMicClient, EvenHubImuClient, EvenH
   attachWindow(hooks: EvenHubWindowHooks): void {
     this.windowHooks = hooks;
     this.shellWindowId = hooks.windowId;
+    this.lastViewport = this.currentViewport();
     // Requests the app made before the window existed.
     if (this.textInputRequested) hooks.setAcceptsTextInput(true);
     if (this.attention) hooks.setAttention(true);
     if (this.windowIcon) hooks.iconChanged();
+  }
+
+  private currentViewport(): { width: number; height: number } {
+    const viewport = this.windowHooks?.getViewport?.() ?? { width: 576, height: 288 };
+    return { width: Math.max(1, Math.round(viewport.width)), height: Math.max(1, Math.round(viewport.height)) };
+  }
+
+  /** Notify extension listeners after the shell changes this window's actual viewport. */
+  viewportChanged(): void {
+    const viewport = this.currentViewport();
+    if (this.lastViewport?.width === viewport.width && this.lastViewport.height === viewport.height) return;
+    this.lastViewport = viewport;
+    this.pushExtEvent("viewport", viewport);
   }
 
   windowClosed(): void {
@@ -1255,6 +1289,8 @@ export class EvenHubSession implements EvenHubMicClient, EvenHubImuClient, EvenH
         // A real quit — bypasses the shutDown(1) → return-to-switcher behavior.
         setTimeout(() => this.close(), 0);
         return null;
+      case "getViewport":
+        return this.currentViewport();
       case "getConfiguredApiKeys":
         return configuredApiKeyServices();
       case "requestApiKeyAccess":
@@ -1267,7 +1303,7 @@ export class EvenHubSession implements EvenHubMicClient, EvenHubImuClient, EvenH
         return null;
       case "createLayout":
       case "replaceLayout":
-        return this.applyExtensionLayout(asRecord(params[0]));
+        return this.applyExtensionLayout(asRecord(params[0]), asRecord(params[1]));
       case "setAssistantTools":
         this.setAssistantTools(Array.isArray(params[0]) ? params[0] : []);
         return null;
@@ -1292,9 +1328,14 @@ export class EvenHubSession implements EvenHubMicClient, EvenHubImuClient, EvenH
         return null;
       case "getFonts":
         return availableFontFamilies();
-      case "measureText":
-        // No font measures in the stock font, as a container without one draws.
-        return measureContainerText(String(params[0] ?? ""), parseFontSpec(params[1]));
+      case "measureText": {
+        const maxWidth = readNumber(asRecord(params[2]), "maxWidth", Number.NaN);
+        return measureContainerText(
+          String(params[0] ?? ""),
+          parseFontSpec(params[1]),
+          Number.isFinite(maxWidth) && maxWidth > 0 ? maxWidth : undefined,
+        );
+      }
       default:
         this.log(`evenhub: unknown extension method ${method}`);
         return null;
@@ -1386,7 +1427,7 @@ export class EvenHubSession implements EvenHubMicClient, EvenHubImuClient, EvenH
    * container-count limit, and per-container `preserve` (inherit content from a
    * same-named container in the outgoing layout). Returns true on success.
    */
-  private applyExtensionLayout(data: Record<string, unknown>): boolean {
+  private applyExtensionLayout(data: Record<string, unknown>, options: Record<string, unknown>): boolean {
     const previous = this.page;
     const page = parsePage(data);
     for (const container of page.containers) {
@@ -1396,8 +1437,8 @@ export class EvenHubSession implements EvenHubMicClient, EvenHubImuClient, EvenH
     this.page = page;
     this.pageCreated = true;
     this.extendedLayout = true;
-    // The extended layout uses the taller app area.
-    this.windowHooks?.setTallCanvas(true);
+    // Legacy layouts request max height. Responsive apps can follow the user's current display mode.
+    if (options.heightMode !== "current") this.windowHooks?.setTallCanvas(true);
     if (this.foreground && !this.launchEnterSent) {
       this.launchEnterSent = true;
       this.emitSysEvent(FOREGROUND_ENTER_EVENT, 0);
@@ -1546,6 +1587,7 @@ export class EvenHubSession implements EvenHubMicClient, EvenHubImuClient, EvenH
     this.locationTracker?.stop();
     this.locationTracker = null;
     for (const off of this.deviceStatusOffs.splice(0)) off();
+    this.uiFontOff();
     if (!this.systemExitSent) {
       // Best effort: lets the app's teardown handlers run before the webview dies.
       this.emitSysEvent(SYSTEM_EXIT_EVENT, 0);

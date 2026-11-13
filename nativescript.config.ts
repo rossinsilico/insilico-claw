@@ -6,7 +6,7 @@ export default {
   appResourcesPath: 'App_Resources',
   ios: {
     // Sideloading under another signing team needs a bundle ID that team owns.
-    id: process.env.IOS_BUNDLE_ID || 'com.faceclaw.app',
+    id: process.env.IOS_BUNDLE_ID || 'com.rosspingatore.faceclawpilot',
   },
   android: {
     v8Flags: '--expose_gc',

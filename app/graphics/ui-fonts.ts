@@ -157,6 +157,8 @@ const roleFontSets: RoleFonts[] = [];
 const uiRoleFonts = new RoleFonts(UI_FONT_KEYS, getUiFontSelection);
 roleFontSets.push(uiRoleFonts);
 let invalidationInstalled = false;
+let uiFontRevision = 0;
+const uiFontChangeListeners = new Set<(revision: number) => void>();
 
 function installInvalidation(): void {
   if (invalidationInstalled) return;
@@ -166,7 +168,23 @@ function installInvalidation(): void {
       if (fonts.keys.includes(key)) fonts.clear();
     }
     if (key === TERMINAL_FONT_SELECTION_KEY) cachedTerminalConfig = null;
+    if (UI_FONT_KEYS.includes(key)) {
+      uiFontRevision++;
+      for (const listener of Array.from(uiFontChangeListeners)) listener(uiFontRevision);
+    }
   });
+}
+
+/** Monotonic revision of the resolved global UI font within this process. */
+export function getUiFontRevision(): number {
+  return uiFontRevision;
+}
+
+/** Listen for global UI font changes, after every cached role has been invalidated. */
+export function onUiFontChanged(listener: (revision: number) => void): () => void {
+  installInvalidation();
+  uiFontChangeListeners.add(listener);
+  return () => uiFontChangeListeners.delete(listener);
 }
 
 /**

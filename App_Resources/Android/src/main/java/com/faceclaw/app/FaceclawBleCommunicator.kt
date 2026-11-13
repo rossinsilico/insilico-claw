@@ -257,6 +257,10 @@ class FaceclawBleCommunicator(context: Context, rightAddress: String?, leftAddre
 
     fun setFaceclawWakeLeaseEnabled(enabled: Boolean): Boolean = core.setFaceclawWakeLeaseEnabled(enabled)
 
+    fun setHeadUpEnabled(enabled: Boolean) = core.setHeadUpEnabled(enabled)
+    fun readHeadUpAngle(): Int = core.readHeadUpAngle()
+    fun setHeadUpAngle(angle: Int): Boolean = core.setHeadUpAngle(angle)
+
     /** See [GlassesSessionCore.setVoiceWakeEnabled]. */
     fun setVoiceWakeEnabled(enabled: Boolean) = core.setVoiceWakeEnabled(enabled)
 

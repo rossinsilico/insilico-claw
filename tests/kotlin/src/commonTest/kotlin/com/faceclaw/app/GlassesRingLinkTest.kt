@@ -7,6 +7,22 @@ class GlassesRingLinkTest {
     private fun toHex(bytes: ByteArray) = bytes.joinToString("") { (it.toInt() and 0xff).toString(16).padStart(2, '0') }
     private val mac = hex("b16a9f2f43dc")
 
+    private fun checkedDeviceResponse(command: Int, seq: Int, args: ByteArray): ByteArray {
+        val modelLength = 12 + args.size
+        val model = byteArrayOf(
+            0x64, RingProtocol.CHAN_DEVICE.toByte(), 0x64, seq.toByte(), 0,
+            RingProtocol.KIND_RSP.toByte(), 0, command.toByte(),
+            modelLength.toByte(), (modelLength ushr 8).toByte(), 0, 0,
+        ) + args
+        var crc = 0xffff
+        for (byte in model) {
+            crc = crc xor (byte.toInt() and 0xff)
+            repeat(8) { crc = if ((crc and 1) != 0) (crc ushr 1) xor 0xa001 else crc ushr 1 }
+        }
+        return RingProtocol.buildFrame(RingProtocol.CHAN_DEVICE, RingProtocol.KIND_RSP, 0, command, seq,
+            byteArrayOf(crc.toByte(), (crc ushr 8).toByte()) + args)
+    }
+
     @Test fun macWireBytesAreLeastSignificantFirst() {
         assertEquals("b16a9f2f43dc", toHex(assertNotNull(macWireBytes("DC:43:2F:9F:6A:B1"))))
         assertNull(macWireBytes(""))
@@ -20,14 +36,22 @@ class GlassesRingLinkTest {
     }
 
     @Test fun connectRequestWireShape() {
-        // commandId=6 magic=0x21 ringInfo(5){connectRing=[01], ringMac, ringName="R1"}
-        assertEquals("08061021" + "2a" + "0f" + "0a0101" + "1206b16a9f2f43dc" + "1a025231",
+        // Stock 2.3.0.24 RingInfo descriptor 0x7acb30: field 1 is BOOL, not bytes.
+        assertEquals("08061021" + "2a" + "0e" + "0801" + "1206b16a9f2f43dc" + "1a025231",
             toHex(BleProtocol.buildRingConnectRequest(0x21, true, mac, "R1".encodeToByteArray())))
+        assertEquals("08061021" + "2a" + "0e" + "0800" + "1206b16a9f2f43dc" + "1a025231",
+            toHex(BleProtocol.buildRingConnectRequest(0x21, false, mac, "R1".encodeToByteArray())))
+    }
+
+    @Test fun connectRequestRespectsFirmwareFieldLimits() {
+        assertFailsWith<IllegalArgumentException> { BleProtocol.buildRingConnectRequest(1, true, ByteArray(5), byteArrayOf()) }
+        assertFailsWith<IllegalArgumentException> { BleProtocol.buildRingConnectRequest(1, true, mac, ByteArray(17)) }
+        assertTrue(BleProtocol.buildRingConnectRequest(1, true, mac, ByteArray(16)).isNotEmpty())
     }
 
     @Test fun parsesGlassesReportsThroughFraming() {
         // A RING_CONNECT_INFO notification: ringInfo{connectRing, ringMac, ringName, connRet=0}.
-        val info = hex("0a0101") + hex("1206") + mac + hex("1a025231") + hex("2000")
+        val info = hex("0801") + hex("1206") + mac + hex("1a025231") + hex("2000")
         val pb = hex("0806") + hex("1005") + byteArrayOf(0x2a, info.size.toByte()) + info
         val frame = BleProtocol.parseFrame(BleProtocol.framePb(pb, BleProtocol.SID_SECURITY_AUTH, 1, 1).single())
         val report = assertNotNull(BleProtocol.parseRingConnectInfo(frame.pb))
@@ -59,6 +83,51 @@ class GlassesRingLinkTest {
             toHex(RingProtocol.buildCheckedFrame(RingProtocol.CHAN_HEALTH, RingProtocol.KIND_REQ, 0x01, 0x01, 5, ByteArray(0))))
         assertEquals("00d4c9ba7064016403000200051200807710ff3348bb69",
             toHex(RingProtocol.buildCheckedFrame(RingProtocol.CHAN_DEVICE, RingProtocol.KIND_DATA, 0x00, 0x05, 3, hex("10ff3348bb69"))))
+    }
+
+    @Test fun freshRecordingCommandsUseTheCheckedEnvelopeAndUtcClockContract() {
+        assertEquals("00d4c9ba7064016403000200051200807710ff3348bb69",
+            toHex(RingProtocol.buildClockSet(3, -240, 0x69bb4833L)))
+
+        val get = RingProtocol.buildHealthSettingsGet(4)
+        assertValidRingFrame(get)
+        assertEquals("00" + "000e", toHex(get.copyOfRange(10, 13)))
+        assertEquals(17, get.size)
+
+        val set = RingProtocol.buildHealthSettingsSet(5, 0x69bb4833L, true)
+        assertValidRingFrame(set)
+        assertEquals("02" + "000e", toHex(set.copyOfRange(10, 13)))
+        assertEquals("3348bb690100000000000000", toHex(set.copyOfRange(17, set.size)))
+    }
+
+    @Test fun inboundResponseChecksumMatchesCapturedPairAuthAndRejectsInnerCorruption() {
+        val captured = hex("00a25aac9264016401000300080d00a76400")
+        val parsed = assertNotNull(RingProtocol.parse(captured))
+        assertEquals("00", toHex(assertNotNull(RingProtocol.parseSuccessfulResponse(parsed,
+            RingProtocol.CMD_LO_PAIR_AUTH, 1))))
+
+        val corruptedPayload = parsed.payload.copyOf()
+        corruptedPayload[0] = (corruptedPayload[0].toInt() xor 1).toByte()
+        val validOuterCrc = RingProtocol.buildFrame(parsed.chan, parsed.kind, parsed.cmdHi, parsed.cmdLo,
+            parsed.seq, corruptedPayload)
+        assertNull(RingProtocol.parseSuccessfulResponse(assertNotNull(RingProtocol.parse(validOuterCrc)),
+            RingProtocol.CMD_LO_PAIR_AUTH, 1))
+    }
+
+    @Test fun healthSettingsResponseRequiresAValidInboundCheckedTwelveByteBody() {
+        val args = hex("3348bb69" + "01" + "00000000000000")
+        val good = assertNotNull(RingProtocol.parse(checkedDeviceResponse(0x0e, 7, args)))
+        val decoded = assertNotNull(RingProtocol.parseHealthSettingsResponse(good))
+        assertEquals(0x69bb4833L, decoded.settingsTimeUtcSeconds)
+        assertTrue(decoded.enabled)
+
+        val bad = good.raw.copyOf()
+        bad[15] = (bad[15].toInt() xor 1).toByte()
+        val reparsed = assertNotNull(RingProtocol.parse(bad))
+        assertTrue(reparsed.crcOk.not(), "outer CRC must notice payload corruption")
+
+        val wrongLength = assertNotNull(RingProtocol.parse(checkedDeviceResponse(0x0e, 7, args.copyOf(11))))
+        assertNull(RingProtocol.parseHealthSettingsResponse(wrongLength))
     }
 
     @Test fun advStartCarriesBothTargetsLeastSignificantFirst() {

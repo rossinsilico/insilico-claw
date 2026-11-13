@@ -7,6 +7,8 @@ import { type ImuReading } from "./imu-types";
 import { fromData, toData } from "./kotlin-data";
 import { previewPixels } from "./ios-graphics";
 import { iosBluetooth } from "./ios-bluetooth";
+import { isValidMacAddress, normalizeMacAddress } from "../g2/device-addresses";
+import { defaultRingName } from "./ring-status";
 
 export type { FirmwareInfo };
 
@@ -51,6 +53,10 @@ export type FrameMetrics = {
   transmitMs: number;
   tileCount: number;
 };
+
+export type RingHealthPullResult = { completed: boolean; pages: number; watermark: number };
+export type BackgroundRingHealthResult = { generation: number; outcome: string; pages: number; watermark: number };
+export type GlassesRingConnectionState = { connected: boolean; ringId: string };
 
 /** See the Android twin: compositor surface configuration in screen pixels. */
 export type SurfaceOptions = {
@@ -138,6 +144,17 @@ class SessionListener extends NSObject {
   onFirmwareInfoLeftVersionRightVersionExtension(leftVersion: string, rightVersion: string, extension: string): void {
     this.bridge.handleFirmwareInfo(String(leftVersion ?? ""), String(rightVersion ?? ""), String(extension ?? ""));
   }
+  onRingHealthPullFinishedCompletedPagesWatermark(completed: boolean, pages: number, watermark: number): void {
+    this.bridge.handleRingHealthPullFinished(Boolean(completed), Number(pages), Number(watermark));
+  }
+  onBackgroundRingHealthFinishedGenerationOutcomePagesWatermark(generation: number, outcome: string, pages: number, watermark: number): void {
+    this.bridge.handleBackgroundRingHealthFinished(Number(generation), String(outcome), Number(pages), Number(watermark));
+  }
+  onSessionRestoredRestoredPeers(restoredPeers: number): void { this.bridge.handleSessionRestored(Number(restoredPeers)); }
+  onGlassesRingConnectionStateConnectedRingId(connected: boolean, ringId: string): void {
+    this.bridge.handleGlassesRingConnectionState(Boolean(connected), String(ringId ?? ""));
+  }
+  onPhoneRingReady(): void { this.bridge.handlePhoneRingReady(); }
 }
 
 @NativeClass()
@@ -232,6 +249,13 @@ export class FaceclawCommunicatorBridge {
   private readonly frameMetricsListeners = new Set<(metrics: FrameMetrics) => void>();
   private readonly previewAnimationListeners = new Set<() => void>();
   private readonly firmwareInfoListeners = new Set<(info: FirmwareInfo) => void>();
+  private readonly ringHealthListeners = new Set<(result: RingHealthPullResult) => void>();
+  private readonly backgroundHealthListeners = new Set<(result: BackgroundRingHealthResult) => void>();
+  private readonly restoreListeners = new Set<(peers: number) => void>();
+  private readonly glassesRingListeners = new Set<(state: GlassesRingConnectionState) => void>();
+  private readonly phoneRingReadyListeners = new Set<() => void>();
+  private latestRestore: number | null = null;
+  private latestState: CommunicatorState = { phase: 'disconnected', status: 'Not connected' };
   private readonly ancsAuthorizationListeners = new Set<(authorized: boolean) => void>();
   private readonly ancsRelayListeners = new Set<(frame: Uint8Array) => void>();
   private audioListener: AudioPacketListener | null = null;
@@ -249,7 +273,172 @@ export class FaceclawCommunicatorBridge {
     return FaceclawCommunicatorBridge.active;
   }
 
-  constructor(addresses: { right: string; left: string; ring?: string; ringRole?: string; glassesType?: GlassesType }) {
+  /** Read-only R1 diagnostics; null with an older framework that lacks the export. */
+  getRingStatus(): string | null {
+    return typeof this.communicator.getRingStatus === "function" ? String(this.communicator.getRingStatus()) : null;
+  }
+
+  /** Release the old R1 role off-main before its replacement owner starts. */
+  async prepareForRingRoleChange(timeoutMs: number, stillAuthorized: () => boolean): Promise<boolean> {
+    return this.enqueueNativeCall(() => {
+      if (this.closed || !stillAuthorized() ||
+          typeof this.communicator.prepareForRingRoleChangeTimeoutMsCompletion !== "function") return false;
+      const budget = Math.max(1, Math.min(30_000, Math.round(nonNegativeNumber(timeoutMs))));
+      return new Promise<boolean>(resolve => {
+        this.communicator.prepareForRingRoleChangeTimeoutMsCompletion(budget,
+          (released: any) => resolve(Boolean(released?.boolValue ?? released)));
+      });
+    });
+  }
+
+  /** Queue only a same-ring G2 connection; success is not a connection acknowledgement. */
+  async connectGlassesRing(ringId: string, stillAuthorized: () => boolean): Promise<boolean> {
+    const mac = normalizeMacAddress(ringId);
+    if (!isValidMacAddress(mac) || /^(?:0{12}|F{12})$/.test(mac.replace(/:/g, "")))
+      throw new Error("A valid configured ring MAC is required.");
+    return this.enqueueNativeCall(() => {
+      if (this.closed || !stillAuthorized() || !this.isSessionReady()) return false;
+      if (typeof this.communicator.setGlassesRingLinkActionFallbackAddressFallbackName !== "function")
+        throw new Error("This Pilot build cannot restore the glasses' ring connection.");
+      this.requireSameGlassesRing(mac);
+      return Boolean(this.communicator.setGlassesRingLinkActionFallbackAddressFallbackName("connect", mac, defaultRingName(mac)));
+    });
+  }
+
+  /** Advertise for the configured G2 pair before requesting its R1 connection. */
+  async bindGlassesRing(addresses: { right: string; left: string; ring: string }, stillAuthorized: () => boolean): Promise<boolean> {
+    const [right, left, ring] = [addresses.right, addresses.left, addresses.ring].map(normalizeMacAddress);
+    if ([right, left, ring].some(mac => !isValidMacAddress(mac) || /^(?:0{12}|F{12})$/.test(mac.replace(/:/g, ""))))
+      throw new Error("Configured hardware MAC addresses are required for ring binding.");
+    if (new Set([right, left, ring]).size !== 3) throw new Error("Ring and glasses hardware addresses must be distinct.");
+    return this.enqueueNativeCall(() => {
+      if (this.closed || !stillAuthorized() || !this.isSessionReady()) return false;
+      if (typeof this.communicator.bindRingToGlassesRightHardwareMacLeftHardwareMacRingHardwareMacRingNameTimeoutMsCompletion !== "function")
+        throw new Error("This Pilot build cannot configure the ring's glasses connection.");
+      this.requireSameGlassesRing(ring);
+      return new Promise<boolean>((resolve, reject) => {
+        this.communicator.bindRingToGlassesRightHardwareMacLeftHardwareMacRingHardwareMacRingNameTimeoutMsCompletion(
+          right, left, ring, defaultRingName(ring), 15_000, (outcome: any) => {
+            const result = String(outcome);
+            if (result === "glasses-connect-queued") resolve(true);
+            else reject(new Error(result || "The ring did not confirm its glasses setup."));
+          });
+      });
+    });
+  }
+
+  cancelGlassesRingBinding(): void {
+    if (typeof this.communicator.cancelRingBinding === "function") this.communicator.cancelRingBinding();
+  }
+
+  private requireSameGlassesRing(mac: string): void {
+    const raw = this.getRingStatus();
+    if (!raw) throw new Error("The glasses' ring identity is not available yet.");
+    const reported = String(JSON.parse(raw).glassesRingMac ?? "").replace(/\s/g, "").toUpperCase();
+    if (reported && reported !== mac.split(":").reverse().join(""))
+      throw new Error("The glasses report a different ring. Review paired devices before reconnecting.");
+  }
+
+  onGlassesRingConnectionState(listener: (state: GlassesRingConnectionState) => void): () => void {
+    this.glassesRingListeners.add(listener);
+    return () => this.glassesRingListeners.delete(listener);
+  }
+
+  onPhoneRingReady(listener: () => void): () => void {
+    this.phoneRingReadyListeners.add(listener);
+    return () => this.phoneRingReadyListeners.delete(listener);
+  }
+
+  handlePhoneRingReady(): void { this.emitAsync(this.phoneRingReadyListeners, undefined); }
+
+  handleGlassesRingConnectionState(connected: boolean, ringId: string): void {
+    if (isValidMacAddress(ringId))
+      this.emitAsync(this.glassesRingListeners, { connected, ringId: normalizeMacAddress(ringId) });
+  }
+
+  takeRingHealthBatch(): { watermark: number; ringId?: string; records: any[] } {
+    return JSON.parse(String(this.communicator.takeRingHealthBatchJson()));
+  }
+
+  clearRingHealthRecordsBelow(watermark: number): number {
+    return Number(this.communicator.clearRingHealthRecordsBelowWatermark(watermark));
+  }
+
+  requestRingHealthNow(): void { this.communicator.requestRingHealthNow(); }
+
+  canSyncRingHealth(): boolean { return !this.closed && Boolean(this.communicator.canSyncRingHealth()); }
+
+  setIndependentRingHealthEnabled(enabled: boolean): void {
+    if (!this.closed) this.communicator.setIndependentRingHealthEnabledEnabled(enabled);
+  }
+
+  setConnectionWanted(wanted: boolean): void {
+    if (!wanted) this.cancelGlassesRingBinding();
+    if (!this.closed) this.communicator.setConnectionWantedWanted(wanted);
+  }
+  configureStateRestoration(enabled: boolean): void { if (!this.closed) this.communicator.configureStateRestorationEnabled(enabled); }
+  startHealthOnly(): boolean {
+    if (this.closed) return false;
+    const started = Boolean(this.communicator.startHealthOnly());
+    if (started) FaceclawCommunicatorBridge.active = this;
+    return started;
+  }
+  async promoteToInteractive(): Promise<void> {
+    await this.enqueueNativeCall(() => { if (!this.closed) this.communicator.promoteToInteractive(); });
+  }
+  requestBackgroundRingHealth(generation: number, timeoutMs: number): boolean {
+    return !this.closed && Boolean(this.communicator.requestBackgroundRingHealthGenerationTimeoutMs(generation, timeoutMs));
+  }
+  cancelBackgroundRingHealth(generation: number): boolean {
+    return !this.closed && Boolean(this.communicator.cancelBackgroundRingHealthGeneration(generation));
+  }
+  get connectionState(): CommunicatorState { return { ...this.latestState }; }
+
+  onBackgroundRingHealthFinished(listener: (result: BackgroundRingHealthResult) => void): () => void {
+    this.backgroundHealthListeners.add(listener);
+    return () => this.backgroundHealthListeners.delete(listener);
+  }
+  onSessionRestored(listener: (peers: number) => void): () => void {
+    this.restoreListeners.add(listener);
+    if (this.latestRestore !== null) {
+      const peers = this.latestRestore;
+      setTimeout(() => { if (!this.closed && this.restoreListeners.has(listener)) listener(peers); }, 0);
+    }
+    return () => this.restoreListeners.delete(listener);
+  }
+  handleBackgroundRingHealthFinished(generation: number, outcome: string, pages: number, watermark: number): void {
+    this.emitAsync(this.backgroundHealthListeners, { generation, outcome, pages, watermark });
+  }
+  handleSessionRestored(peers: number): void {
+    this.latestRestore = peers;
+    this.emitAsync(this.restoreListeners, peers);
+  }
+
+  /** One explicit, response-verified R1 recording/clock operation; ordinary sync stays read-only. */
+  async startRingHealthRecordingNow(): Promise<string> {
+    if (!this.isSessionReady()) throw new Error("Connect the glasses before starting R1 recording.");
+    if (typeof this.communicator.requestRingHealthStartFresh !== "function") {
+      throw new Error("This Pilot build does not support starting R1 recording.");
+    }
+    const generation = await this.enqueueNativeCall(() => Number(this.communicator.requestRingHealthStartFresh()));
+    const deadline = Date.now() + 75_000;
+    while (Date.now() < deadline) {
+      const status = JSON.parse(String(this.communicator.getRingStatus()));
+      if (Number(status.freshStartGeneration) === generation) {
+        const result = String(status.freshStartResult ?? "");
+        if (status.freshStartState === "succeeded") return result;
+        if (status.freshStartState === "failed") throw new Error(result || "R1 recording start failed.");
+      }
+      await new Promise(resolve => setTimeout(resolve, 250));
+    }
+    throw new Error("R1 did not report a final recording-start result before the safety deadline.");
+  }
+
+  static decodeRingHealthJournal(text: string, afterReceivedAtMs: number): any[] {
+    return JSON.parse(String(FaceclawKitIosGlassesSession.companion.decodeRingHealthJournalTextAfterReceivedAtMs(text, afterReceivedAtMs)));
+  }
+
+  constructor(addresses: { right: string; left: string; ring?: string; ringRole?: string; healthRingId?: string; independentRingHealth?: boolean; glassesType?: GlassesType }) {
     if (addresses.glassesType === "rayneo-io") {
       throw new Error("RayNeo iO glasses are not supported on iOS yet.");
     }
@@ -258,6 +447,8 @@ export class FaceclawCommunicatorBridge {
       String(addresses.left ?? "").toUpperCase(),
       String(addresses.ring ?? "").toUpperCase(),
     );
+    if (addresses.healthRingId) this.communicator.setRingHealthIdentityRingId(addresses.healthRingId);
+    if (addresses.independentRingHealth !== undefined) this.setIndependentRingHealthEnabled(addresses.independentRingHealth);
     // The shared session halts on any other firmware ("incompatible-firmware").
     this.communicator.setRequiredFirmwareRevisionRevision(REQUIRED_FACECLAW_FIRMWARE_VERSION);
     if (addresses.glassesType === "g1") this.communicator.useG1();
@@ -278,6 +469,7 @@ export class FaceclawCommunicatorBridge {
 
   /** @internal */
   handleStateChange(phase: string, status: string): void {
+    this.latestState = { phase: phase as CommunicatorPhase, status };
     this.emitAsync(this.stateListeners, { phase: phase as CommunicatorPhase, status });
   }
 
@@ -341,6 +533,12 @@ export class FaceclawCommunicatorBridge {
   }
 
   /** @internal */
+  handleRingHealthPullFinished(completed: boolean, pages: number, watermark: number): void {
+    if (this.closed || !Number.isSafeInteger(pages) || pages < 0 || !Number.isSafeInteger(watermark) || watermark < 0) return;
+    this.emitAsync(this.ringHealthListeners, { completed, pages, watermark });
+  }
+
+  /** @internal */
   handleAncsAuthorization(authorized: boolean): void { this.emitAsync(this.ancsAuthorizationListeners, authorized); }
 
   /** @internal */
@@ -349,7 +547,8 @@ export class FaceclawCommunicatorBridge {
   private emitAsync<T>(listeners: Set<(value: T) => void>, value: T): void {
     const snapshot = Array.from(listeners);
     setTimeout(() => {
-      for (const listener of snapshot) listener(value);
+      if (this.closed) return;
+      for (const listener of snapshot) if (listeners.has(listener)) listener(value);
     }, 0);
   }
 
@@ -446,6 +645,11 @@ export class FaceclawCommunicatorBridge {
   onFirmwareInfo(listener: (info: FirmwareInfo) => void): () => void {
     this.firmwareInfoListeners.add(listener);
     return () => this.firmwareInfoListeners.delete(listener);
+  }
+
+  onRingHealthPullFinished(listener: (result: RingHealthPullResult) => void): () => void {
+    this.ringHealthListeners.add(listener);
+    return () => this.ringHealthListeners.delete(listener);
   }
 
   getNativeCommunicator(): any {
@@ -701,6 +905,33 @@ export class FaceclawCommunicatorBridge {
     return this.enqueueNativeCall(() => Boolean(this.communicator.setFaceclawWakeLeaseEnabledEnabled(Boolean(enabled))));
   }
 
+  async setHeadUpEnabled(enabled: boolean): Promise<void> {
+    await this.enqueueNativeCall(() => this.communicator.setHeadUpEnabledEnabled(Boolean(enabled)));
+  }
+
+  async readHeadUpAngle(stillCurrent: () => boolean = () => true): Promise<number> {
+    return new Promise<number>((resolve, reject) => {
+      void this.enqueueNativeCall(() => {
+        if (this.closed || !stillCurrent()) { resolve(-1); return; }
+        this.communicator.readHeadUpAngleCompletion((result: any) => {
+          const value = result?.intValue ?? result;
+          resolve(!this.closed && stillCurrent() && typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 60 ? value : -1);
+        });
+      }).catch(reject);
+    });
+  }
+
+  async setHeadUpAngle(angle: number, stillCurrent: () => boolean = () => true): Promise<boolean> {
+    if (!Number.isInteger(angle) || angle < 0 || angle > 60) return false;
+    return new Promise<boolean>((resolve, reject) => {
+      void this.enqueueNativeCall(() => {
+        if (this.closed || !stillCurrent()) { resolve(false); return; }
+        this.communicator.setHeadUpAngleAngleCompletion(angle,
+          (result: any) => resolve(!this.closed && stillCurrent() && Boolean(result?.boolValue ?? result)));
+      }).catch(reject);
+    });
+  }
+
   /** The RayNeo iO's wake word; iOS doesn't drive an iO, so nothing to do. */
   async setVoiceWakeEnabled(_enabled: boolean): Promise<void> {}
 
@@ -715,6 +946,7 @@ export class FaceclawCommunicatorBridge {
   }
 
   async close(): Promise<void> {
+    this.cancelGlassesRingBinding();
     this.closed = true;
     if (FaceclawCommunicatorBridge.active === this) FaceclawCommunicatorBridge.active = null;
     this.setAncsListeners(false);

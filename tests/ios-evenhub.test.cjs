@@ -84,6 +84,11 @@ function sessionHarness(overrides = {}, playBuzzer = () => {}, { packageId = 'te
     '@nativescript/core': { ApplicationSettings: { getString: (k, d) => settings.get(k) ?? d, setString: (k, v) => settings.set(k, v) } },
     'upng-js': require('upng-js'),
     '../../graphics/evenhub-font': { EvenHubFont: { get: () => ({ drawText() {}, drawTextWrapped() {}, lineHeight: 20 }) } },
+    '../../graphics/ui-fonts': {
+      getDefaultSmallFont: () => ({ measureText: text => text.length * 10, drawText() {}, lineHeight: 20 }),
+      getUiFontRevision: () => 0,
+      onUiFontChanged: () => () => {},
+    },
     '../../ui/dashboard-settings': {}, '../../ui/sound-effects': {}, './api-key-dialog': {},
     './mic-router': { evenHubMicRouter: {} }, './imu-router': { evenHubImuRouter: {} },
     './compass-router': { evenHubCompassRouter: {} }, '../../assistant/tool-registry': {},

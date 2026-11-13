@@ -5,12 +5,13 @@ const flush = () => new Promise(resolve => setImmediate(resolve));
 
 function nativeLocation() {
   const instances = [];
+  const FaceclawLocation = { shared: () => ({ hasPermission: () => true }) };
   const FaceclawLocationUpdates = { new() {
     const value = { stopped: 0, startOnce() { this.once = true; }, startTracking(ms) { this.interval = ms; },
       stop() { this.stopped++; this.eventHandler = null; } };
     instances.push(value); return value;
   } };
-  return { instances, load: loader({ FaceclawLocationUpdates }) };
+  return { instances, load: loader({ FaceclawLocation, FaceclawLocationUpdates }) };
 }
 const fix = { latitude: 37.7, longitude: -122.4, accuracyMeters: 8, bearingDeg: null, speedMps: null, timestampMs: 1234 };
 

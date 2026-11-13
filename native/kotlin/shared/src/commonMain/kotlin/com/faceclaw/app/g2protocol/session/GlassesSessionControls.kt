@@ -2,6 +2,7 @@ package com.faceclaw.app
 
 import com.faceclaw.app.GlassesSessionCore.Companion.DASHBOARD_TILE
 import com.faceclaw.app.GlassesSessionCore.Companion.FACECLAW_WAKE_CONTROL_WAIT_MS
+import com.faceclaw.app.GlassesSessionCore.Companion.HEAD_UP_ANGLE_WAIT_MS
 import com.faceclaw.app.GlassesSessionCore.Companion.TAG
 
 /*
@@ -325,6 +326,126 @@ internal fun GlassesSessionCore.waitForFaceclawFramebufferControlDelivery(genera
     }
 }
 
+internal fun GlassesSessionCore.readHeadUpAngleExplicit(expectedSessionGeneration: Long? = null): Int {
+    val operation = beginHeadUpAngleOperation(expectedSessionGeneration) ?: return -1
+    return try {
+        readHeadUpAngleForOperation(operation.first, operation.second)
+    } finally {
+        finishHeadUpAngleOperation(operation.first)
+    }
+}
+
+internal fun GlassesSessionCore.setHeadUpAngleExplicit(
+    angle: Int,
+    expectedSessionGeneration: Long? = null,
+): Boolean {
+    if (angle !in 0..60) return false
+    val operation = beginHeadUpAngleOperation(expectedSessionGeneration) ?: return false
+    return try {
+        if (!writeHeadUpAngleForOperation(angle, operation.first, operation.second)) return false
+        readHeadUpAngleForOperation(operation.first, operation.second) == angle
+    } finally {
+        finishHeadUpAngleOperation(operation.first)
+    }
+}
+
+private fun GlassesSessionCore.beginHeadUpAngleOperation(
+    expectedSessionGeneration: Long?,
+): Pair<Long, Long>? = monitor.withLock {
+    if (!running || !sessionReady || !isG2 || headUpOperationActive
+            || expectedSessionGeneration != null && expectedSessionGeneration != headUpSessionGeneration) return null
+    headUpOperationActive = true
+    Pair(++headUpOperationGeneration, headUpSessionGeneration)
+}
+
+private fun GlassesSessionCore.finishHeadUpAngleOperation(operation: Long) {
+    monitor.withLock {
+        if (headUpOperationGeneration != operation) return
+        clearMessagesOfKindLocked("head-up-angle-write")
+        clearMessagesOfKindLocked("head-up-angle-query")
+        headUpOperationActive = false
+        monitor.signalAll()
+    }
+}
+
+private fun GlassesSessionCore.headUpOperationIsCurrent(operation: Long, session: Long): Boolean =
+    running && sessionReady && headUpOperationActive &&
+        headUpOperationGeneration == operation && headUpSessionGeneration == session
+
+private fun GlassesSessionCore.writeHeadUpAngleForOperation(angle: Int, operation: Long, session: Long): Boolean {
+    val done = BooleanArray(2)
+    monitor.withLock {
+        if (!headUpOperationIsCurrent(operation, session)) return false
+        val right = messageBuilder.headUpAngleWrite(angle, false)
+        val left = messageBuilder.headUpAngleWrite(angle, true)
+        right.onAck = MessageCallback { if (headUpOperationIsCurrent(operation, session)) done[0] = true }
+        left.onAck = MessageCallback { if (headUpOperationIsCurrent(operation, session)) done[1] = true }
+        right.onTimeout = MessageCallback { if (headUpOperationIsCurrent(operation, session)) done[0] = true }
+        left.onTimeout = MessageCallback { if (headUpOperationIsCurrent(operation, session)) done[1] = true }
+        pendingMessages.addFirst(left)
+        pendingMessages.addFirst(right)
+    }
+    interruptibleSleep.interrupt()
+    return waitForHeadUpAngleOperation(operation, session, done)
+}
+
+private fun GlassesSessionCore.readHeadUpAngleForOperation(operation: Long, session: Long): Int {
+    val angles = IntArray(2) { Int.MIN_VALUE }
+    monitor.withLock {
+        if (!headUpOperationIsCurrent(operation, session)) return -1
+        val right = messageBuilder.headUpAngleQuery(false)
+        val left = messageBuilder.headUpAngleQuery(true)
+        right.onAck = MessageCallback {
+            if (headUpOperationIsCurrent(operation, session))
+                angles[0] = BleProtocol.parseHeadUpAngle(right.ackPayload, right.magic)
+        }
+        left.onAck = MessageCallback {
+            if (headUpOperationIsCurrent(operation, session))
+                angles[1] = BleProtocol.parseHeadUpAngle(left.ackPayload, left.magic)
+        }
+        right.onTimeout = MessageCallback { if (headUpOperationIsCurrent(operation, session)) angles[0] = -1 }
+        left.onTimeout = MessageCallback { if (headUpOperationIsCurrent(operation, session)) angles[1] = -1 }
+        pendingMessages.addFirst(left)
+        pendingMessages.addFirst(right)
+    }
+    interruptibleSleep.interrupt()
+    if (!waitForHeadUpAngleOperation(operation, session, angles, Int.MIN_VALUE)) return -1
+    return if (angles[0] >= 0 && angles[0] == angles[1]) angles[0] else -1
+}
+
+private fun GlassesSessionCore.waitForHeadUpAngleOperation(
+    operation: Long,
+    session: Long,
+    values: BooleanArray,
+): Boolean {
+    val deadline = now() + HEAD_UP_ANGLE_WAIT_MS
+    monitor.withLock {
+        while (headUpOperationIsCurrent(operation, session) && values.any { !it }) {
+            val remaining = deadline - now()
+            if (remaining <= 0) break
+            monitor.awaitMs(minOf(remaining, 100L))
+        }
+        return headUpOperationIsCurrent(operation, session) && values.all { it }
+    }
+}
+
+private fun GlassesSessionCore.waitForHeadUpAngleOperation(
+    operation: Long,
+    session: Long,
+    values: IntArray,
+    pending: Int,
+): Boolean {
+    val deadline = now() + HEAD_UP_ANGLE_WAIT_MS
+    monitor.withLock {
+        while (headUpOperationIsCurrent(operation, session) && values.any { it == pending }) {
+            val remaining = deadline - now()
+            if (remaining <= 0) break
+            monitor.awaitMs(minOf(remaining, 100L))
+        }
+        return headUpOperationIsCurrent(operation, session) && values.all { it != pending }
+    }
+}
+
 internal fun GlassesSessionCore.releaseFaceclawFramebufferLease(): Boolean {
     val generation: Int
     monitor.withLock {
@@ -415,6 +536,7 @@ internal fun GlassesSessionCore.handleIncompatibleFirmware() {
 internal fun GlassesSessionCore.haltReconnectLocked(reason: String) {
     reconnectHalted = true
     sessionReady = false
+    headUpSessionGeneration++
     fixedLayoutCreated = false
     startupProbePending = false
     shutdownRequested = false
@@ -444,6 +566,7 @@ internal fun GlassesSessionCore.handleTransportFailure(reason: String?, displayS
         val sessionWasReady = sessionReady
         if (sessionWasReady) countSessionEnded("failure")
         sessionReady = false
+        headUpSessionGeneration++
         fixedLayoutCreated = false
         startupProbePending = false
         shutdownRequested = false
@@ -630,6 +753,66 @@ internal fun GlassesSessionCore.finishFrame(frameId: Int, outcome: String) {
             current.onFrameFinished(frameId, outcome)
         } catch (t: Throwable) {
             logWarn("listener onFrameFinished failed", t)
+        }
+    }
+}
+
+internal fun GlassesSessionCore.emitRingHealthPullFinished(completed: Boolean, pages: Int, watermark: Long) {
+    val current = listener ?: return
+    host.postToMain {
+        try {
+            current.onRingHealthPullFinished(completed, pages, watermark)
+        } catch (t: Throwable) {
+            logWarn("listener onRingHealthPullFinished failed", t)
+        }
+    }
+}
+
+internal fun GlassesSessionCore.emitBackgroundRingHealthFinished(
+    generation: Long,
+    outcome: String,
+    pages: Int,
+    watermark: Long,
+) {
+    val current = listener ?: return
+    host.postToMain {
+        try {
+            current.onBackgroundRingHealthFinished(generation, outcome, pages, watermark)
+        } catch (t: Throwable) {
+            logWarn("listener onBackgroundRingHealthFinished failed", t)
+        }
+    }
+}
+
+internal fun GlassesSessionCore.emitSessionRestored(restoredPeers: Int) {
+    val current = listener ?: return
+    host.postToMain {
+        try {
+            current.onSessionRestored(restoredPeers)
+        } catch (t: Throwable) {
+            logWarn("listener onSessionRestored failed", t)
+        }
+    }
+}
+
+internal fun GlassesSessionCore.emitGlassesRingConnectionState(connected: Boolean, ringId: String) {
+    val current = listener ?: return
+    host.postToMain {
+        try {
+            current.onGlassesRingConnectionState(connected, ringId)
+        } catch (t: Throwable) {
+            logWarn("listener onGlassesRingConnectionState failed", t)
+        }
+    }
+}
+
+internal fun GlassesSessionCore.emitPhoneRingReady() {
+    val current = listener ?: return
+    host.postToMain {
+        try {
+            current.onPhoneRingReady()
+        } catch (t: Throwable) {
+            logWarn("listener onPhoneRingReady failed", t)
         }
     }
 }

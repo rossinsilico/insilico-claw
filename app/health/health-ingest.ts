@@ -49,9 +49,10 @@
 import {
   HOUR_MS,
   TEN_MINUTES_MS,
-  type HealthSample,
-  type SleepSession,
+  type R1SampleOrigin,
   type SleepSegment,
+  type UnstoredHealthSample,
+  type UnstoredSleepSession,
   startOfLocalDay,
 } from "./health-types";
 
@@ -65,6 +66,7 @@ export type WireHourlyRecord = {
    * zero bytes instead.
    */
   anchorMs: number | null;
+  provenance?: R1SampleOrigin;
   groups: readonly { hourIndex: number; avg: number; max: number; min: number }[];
 };
 
@@ -73,6 +75,7 @@ export type WireStepsRecord = {
   kind: "steps";
   /** The day anchor. Steps pages always carried one in the capture. */
   anchorMs: number | null;
+  provenance?: R1SampleOrigin;
   /** Raw buckets. `index` is the ring's own, whose meaning is NOT known. */
   buckets: readonly { index: number; steps: number; activeCalories: number; totalCalories: number }[];
 };
@@ -111,13 +114,16 @@ export type WireSleepRecord = {
    * module's: see `sleepClockCorrectionMs` in `health-live.ts`.
    */
   clockCorrectionMs?: number;
+  temperatureRaw?: number | null;
+  utcOffsetMinutes?: number;
+  provenance?: R1SampleOrigin;
 };
 
 export type WireRecord = WireHourlyRecord | WireStepsRecord | WireSleepRecord;
 
 export type ConversionResult = {
-  samples: HealthSample[];
-  sleep: SleepSession[];
+  samples: UnstoredHealthSample[];
+  sleep: UnstoredSleepSession[];
   /** Every record or group deliberately not stored, with the reason. */
   skipped: { what: string; why: string }[];
 };
@@ -163,6 +169,7 @@ function convertHourly(record: WireHourlyRecord, result: ConversionResult): void
       max: group.max,
       avg: group.avg,
       total: group.avg,
+      provenance: record.provenance,
     });
   }
 }
@@ -218,6 +225,17 @@ function convertSteps(record: WireStepsRecord, result: ConversionResult): void {
       max: bucket.steps,
       avg: bucket.steps,
       total: bucket.steps,
+      provenance: record.provenance,
+    });
+    result.samples.push({
+      metric: "activeCalories",
+      startMs,
+      spanMs: TEN_MINUTES_MS,
+      min: bucket.activeCalories,
+      max: bucket.activeCalories,
+      avg: bucket.activeCalories,
+      total: bucket.activeCalories,
+      provenance: record.provenance,
     });
     result.samples.push({
       metric: "calories",
@@ -227,6 +245,7 @@ function convertSteps(record: WireStepsRecord, result: ConversionResult): void {
       max: bucket.totalCalories,
       avg: bucket.totalCalories,
       total: bucket.totalCalories,
+      provenance: record.provenance,
     });
   }
 }
@@ -264,6 +283,9 @@ function convertSleep(record: WireSleepRecord, result: ConversionResult): void {
     lightSec: record.lightSec,
     deepSec: record.deepSec,
     segments: record.segments,
+    temperatureRaw: record.temperatureRaw,
+    utcOffsetMinutes: record.utcOffsetMinutes,
+    provenance: record.provenance,
   };
 
   if (typeof record.clockCorrectionMs === "number") {

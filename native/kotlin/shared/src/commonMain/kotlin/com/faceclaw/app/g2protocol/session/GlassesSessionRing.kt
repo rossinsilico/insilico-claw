@@ -97,9 +97,8 @@ private const val RING_HEALTH_WINDOW_MIN_INTERVAL_MS = 5L * 60L * 1000L
 
 /**
  * Direct mode: how long a health window waits for its phone-role link to be
- * up before giving up and handing the link back to the glasses role. Bounds
- * only the connect; a pull that has started runs to completion on the ring
- * worker before the deadline is looked at again.
+ * up and finish one pull before handing the link back to the glasses role.
+ * Blocking transport calls receive the remaining budget; waits also check it.
  */
 private const val RING_HEALTH_WINDOW_CONNECT_TIMEOUT_MS = 60_000L
 
@@ -157,12 +156,258 @@ class RingHealthBatch internal constructor(
     val records: List<RingProtocol.HealthRecord>,
     /** Total-ever-added at the instant of the snapshot. */
     val watermark: Long,
+    val ringId: String? = null,
 )
+
+private val RING_HEALTH_IDENTITY = Regex("[0-9A-F]{2}(?::[0-9A-F]{2}){5}")
+
+internal fun normalizeRingHealthIdentity(value: String): String? {
+    val normalized = value.trim().uppercase()
+    return normalized.takeIf(RING_HEALTH_IDENTITY::matches)
+}
+
+private class BackgroundRingHealthCompletion(
+    val generation: Long,
+    val outcome: String,
+    val pages: Int,
+    val watermark: Long,
+    val disconnectRing: Boolean,
+)
+
+private class RingRoleChangeRequest(
+    val generation: Long,
+    val deadlineMs: Long,
+    val requiresLegacyDisable: Boolean,
+)
+
+internal fun GlassesSessionCore.requestBackgroundRingHealthJob(generation: Long, timeoutMs: Int): Boolean {
+    val accepted = monitor.withLock {
+        if (!running || userDisconnectRequested || !hasRingAddress() || !host.supportsRingHealth() ||
+            !host.ringHealthReadOnly() || !independentRingHealthEnabled || backgroundRingHealthActive ||
+            ringHealthPullRequested || ringHealthStartFreshRequested || ringHealthStartFreshActive ||
+            ringHealthWindowActive || ringHealthTransferActive) return@withLock false
+        backgroundRingHealthActive = true
+        backgroundRingHealthGeneration = generation
+        backgroundRingHealthDeadlineMs = now() + timeoutMs.coerceIn(1, 60_000)
+        backgroundRingHealthPagesBefore = ringHealthPageCounter
+        ringHealthPullRequested = true
+        monitor.signalAll()
+        true
+    }
+    if (accepted) interruptibleSleep.interrupt()
+    return accepted
+}
+
+internal fun GlassesSessionCore.cancelBackgroundRingHealthJob(generation: Long): Boolean {
+    val completion = monitor.withLock {
+        if (!backgroundRingHealthActive || backgroundRingHealthGeneration != generation) return false
+        finishBackgroundRingHealthLocked("cancelled")
+    }
+    if (completion.disconnectRing) link.disconnect(ringAddress)
+    emitBackgroundRingHealthFinished(completion.generation, completion.outcome, completion.pages, completion.watermark)
+    return true
+}
+
+internal fun GlassesSessionCore.expireBackgroundRingHealthJob() {
+    val completion = monitor.withLock {
+        if (!backgroundRingHealthActive || now() < backgroundRingHealthDeadlineMs) return
+        finishBackgroundRingHealthLocked("expired")
+    }
+    if (completion.disconnectRing) link.disconnect(ringAddress)
+    emitBackgroundRingHealthFinished(completion.generation, completion.outcome, completion.pages, completion.watermark)
+}
+
+internal fun GlassesSessionCore.finishBackgroundRingHealth(outcome: String) {
+    val completion = monitor.withLock {
+        if (!backgroundRingHealthActive) return
+        finishBackgroundRingHealthLocked(if (now() >= backgroundRingHealthDeadlineMs) "expired" else outcome)
+    }
+    if (completion.disconnectRing) link.disconnect(ringAddress)
+    emitBackgroundRingHealthFinished(completion.generation, completion.outcome, completion.pages, completion.watermark)
+}
+
+internal fun GlassesSessionCore.finishBackgroundRingHealth(outcome: String, owningGeneration: Long?) {
+    if (owningGeneration == null) return
+    val completion = monitor.withLock {
+        if (!backgroundRingHealthActive || backgroundRingHealthGeneration != owningGeneration) return
+        finishBackgroundRingHealthLocked(if (now() >= backgroundRingHealthDeadlineMs) "expired" else outcome)
+    }
+    if (completion.disconnectRing) link.disconnect(ringAddress)
+    emitBackgroundRingHealthFinished(completion.generation, completion.outcome, completion.pages, completion.watermark)
+}
+
+private fun GlassesSessionCore.finishBackgroundRingHealthLocked(outcome: String): BackgroundRingHealthCompletion {
+    val completion = BackgroundRingHealthCompletion(
+        backgroundRingHealthGeneration,
+        outcome,
+        ringHealthPageCounter - backgroundRingHealthPagesBefore,
+        ringHealthTotalAdded,
+        ringConnectAttemptActive || ringBackgroundConnectPending ||
+            ringHealthWindowIndependent && ringConnected && !ringNotificationsReady,
+    )
+    backgroundRingHealthActive = false
+    backgroundRingHealthDeadlineMs = 0L
+    ringHealthPullRequested = false
+    if (ringHealthTransferActive) ringHealthTransferFailed = true
+    if (ringConnectAttemptActive || ringBackgroundConnectPending) {
+        ringConnectAttemptGeneration++
+        ringConnectAttemptActive = false
+        ringBackgroundConnectPending = false
+        rejectNextRingConnection = true
+    }
+    endRingHealthWindowLocked("background job $outcome")
+    monitor.signalAll()
+    return completion
+}
+
+internal fun GlassesSessionCore.prepareForRingRoleChangeOnWorker(timeoutMs: Int): Boolean {
+    val budgetMs = timeoutMs.coerceIn(1, 30_000)
+    val backgroundGeneration = monitor.withLock {
+        backgroundRingHealthGeneration.takeIf { backgroundRingHealthActive }
+    }
+    if (backgroundGeneration != null) cancelBackgroundRingHealthJob(backgroundGeneration)
+    val generation = monitor.withLock {
+        if (!running || userDisconnectRequested || !ringWorkerStarted ||
+            ringRoleChangeRequestActive || ringRoleChangeFrozen) return false
+        val requiresLegacyDisable = directRingRole == DIRECT_RING_ROLE_GLASSES
+        if (requiresLegacyDisable && (!ringConnected || !ringNotificationsReady)) return false
+        ringRoleChangeGeneration++
+        ringRoleChangeRequestActive = true
+        ringRoleChangeRequiresLegacyDisable = requiresLegacyDisable
+        ringRoleChangeDeadlineMs = now() + budgetMs
+        ringRoleChangeResult = null
+        ringHealthTransferFailed = true
+        ringHealthPullRequested = false
+        ringHealthStartFreshRequested = false
+        ringConnectAttemptGeneration++
+        monitor.signalAll()
+        ringRoleChangeGeneration
+    }
+    interruptibleSleep.interrupt()
+    return monitor.withLock {
+        while (generation == ringRoleChangeGeneration && ringRoleChangeResult == null) {
+            val left = ringRoleChangeDeadlineMs - now()
+            if (left <= 0L) break
+            monitor.awaitMs(left)
+        }
+        val result = if (generation == ringRoleChangeGeneration) ringRoleChangeResult == true else false
+        if (!result && generation == ringRoleChangeGeneration && ringRoleChangeResult == null) {
+            ringRoleChangeGeneration++
+            ringRoleChangeRequestActive = false
+            ringRoleChangeResult = false
+            monitor.signalAll()
+        }
+        result
+    }
+}
+
+/** Ring-worker-only acknowledged teardown of the old GLASSES-role link. */
+internal fun GlassesSessionCore.processRingRoleChangePreparation(): Boolean {
+    val request = monitor.withLock {
+        if (!ringRoleChangeRequestActive) return false
+        RingRoleChangeRequest(
+            ringRoleChangeGeneration,
+            ringRoleChangeDeadlineMs,
+            ringRoleChangeRequiresLegacyDisable,
+        )
+    }
+    val generation = request.generation
+    val deadline = request.deadlineMs
+    fun remaining(): Int = (deadline - now()).coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+    var legacyDisabled = false
+    var success = false
+    var recoveryVerified = !request.requiresLegacyDisable
+    var disconnectStarted = false
+    try {
+        val descriptorBudget = remaining()
+        if (!request.requiresLegacyDisable) {
+            legacyDisabled = true
+        } else if (descriptorBudget > 0) {
+            legacyDisabled = link.enableNotifications(
+                ringAddress,
+                BleProtocol.R1_LEGACY_NOTIFY_CHAR_UUID,
+                false,
+                descriptorBudget,
+            )
+        }
+        if (legacyDisabled && monitor.withLock {
+                generation == ringRoleChangeGeneration && ringRoleChangeRequestActive && running
+            }) {
+            val disconnectBudget = remaining()
+            if (disconnectBudget > 0) disconnectStarted = true
+            if (disconnectBudget > 0 && link.disconnectAndAwait(ringAddress, disconnectBudget)) {
+                val settleDeadline = now() + RING_ROLE_SWITCH_SETTLE_MS
+                if (settleDeadline <= deadline) {
+                    while (now() < settleDeadline) {
+                        val current = monitor.withLock {
+                            generation == ringRoleChangeGeneration && ringRoleChangeRequestActive && running
+                        }
+                        if (!current) break
+                        interruptibleSleep.sleep(settleDeadline - now())
+                    }
+                    success = now() >= settleDeadline && now() <= deadline && monitor.withLock {
+                        generation == ringRoleChangeGeneration && ringRoleChangeRequestActive && running
+                    }
+                }
+            }
+        }
+    } catch (t: Throwable) {
+        logLine("ring role teardown failed: " + GlassesSessionCore.safeMessage(t))
+    }
+    if (!success && request.requiresLegacyDisable && link.isConnected(ringAddress)) {
+        val retryBudget = remaining()
+        if (retryBudget > 0) {
+            recoveryVerified = link.enableNotifications(
+                ringAddress,
+                BleProtocol.R1_LEGACY_NOTIFY_CHAR_UUID,
+                true,
+                retryBudget,
+            )
+        }
+    }
+    if (!success && request.requiresLegacyDisable && !recoveryVerified) {
+        link.disconnect(ringAddress)
+    }
+    monitor.withLock {
+        if (!success && request.requiresLegacyDisable && !recoveryVerified) {
+            ringConnected = false
+            ringNotificationsReady = false
+            ringReconnectAfterMs = now() + RING_ROLE_SWITCH_SETTLE_MS
+        }
+        if (!success && !request.requiresLegacyDisable && disconnectStarted) {
+            ringConnected = false
+            ringNotificationsReady = false
+            ringReconnectAfterMs = now() + RING_ROLE_SWITCH_SETTLE_MS
+        }
+        if (generation == ringRoleChangeGeneration) {
+            ringRoleChangeRequestActive = false
+            ringRoleChangeResult = success
+            ringRoleChangeFrozen = success
+            if (success) {
+                ringConnected = false
+                ringNotificationsReady = false
+                ringBackgroundConnectPending = false
+            }
+            monitor.signalAll()
+        }
+    }
+    return true
+}
 
 /** Sole owner of blocking ring operations; callbacks only enqueue ACKs. */
 internal fun GlassesSessionCore.runRingWorker() {
     while (running) {
+        val owningBackgroundGeneration = monitor.withLock {
+            backgroundRingHealthGeneration.takeIf { backgroundRingHealthActive }
+        }
         try {
+            if (processRingRoleChangePreparation()) continue
+            if (monitor.withLock { ringRoleChangeFrozen }) {
+                monitor.withLock { if (running && ringRoleChangeFrozen) monitor.awaitMs(100) }
+                continue
+            }
+            if (processRingBindingOperation()) continue
+            expireBackgroundRingHealthJob()
             expireRingHealthWindow()
             restartRingLinkForRoleChange()
             if (shouldAttemptRingConnect()) tryConnectRing("ring worker")
@@ -189,6 +434,7 @@ internal fun GlassesSessionCore.runRingWorker() {
                 lastDirectRingError = "worker error: " + GlassesSessionCore.safeMessage(t)
             }
             link.disconnect(ringAddress)
+            finishBackgroundRingHealth("aborted", owningBackgroundGeneration)
         }
     }
     logLine("ring worker stop")
@@ -241,17 +487,58 @@ internal fun GlassesSessionCore.handleRingHealthNotification(characteristicUuid:
         // Never act on a frame whose CRC failed: the payload offsets below
         // are only meaningful for an intact frame.
         logLine("ring frame CRC mismatch " + frame.describe())
+        failRingHealthTransfer()
         return true
     }
 
+    // A callback blocked on durable storage is not DATA-idle. Keep this count
+    // until decoding/ACK queueing is finished, including all early returns.
+    monitor.withLock { ringHealthIntakeInFlight++ }
+    return try {
+        processRingHealthFrame(frame)
+    } finally {
+        monitor.withLock {
+            ringHealthIntakeInFlight--
+            monitor.signalAll()
+        }
+    }
+}
+
+private fun GlassesSessionCore.processRingHealthFrame(frame: RingProtocol.Frame): Boolean {
     // Keep the original bytes before acknowledging them. Ring firmware
     // variants can have layouts we cannot decode yet, and the ring may
     // never deliver an acknowledged page again. This private journal also
     // lets us diagnose a new device without repeatedly draining its data.
-    if (!journalRingFrame(frame)) return true
+    if (!journalRingFrame(frame)) {
+        failRingHealthTransfer()
+        return true
+    }
 
     // Route on the CHAN byte, not on the shape of the payload.
     if (frame.chan != RingProtocol.CHAN_HEALTH) {
+        monitor.withLock {
+            if (ringHealthTransferActive && ringPhoneAuthExpectedSeq >= 0
+                && frame.chan == RingProtocol.CHAN_DEVICE && frame.cmdHi == 0
+                && frame.cmdLo == RingProtocol.CMD_LO_PAIR_AUTH && frame.seq == ringPhoneAuthExpectedSeq
+                && RingProtocol.responseResult(frame.kind) != null) {
+                // Stock pairAuth replies with the request's sequence and one zero
+                // byte after the two checksum bytes. This accepts the PHONE role;
+                // it is not a claim that bonding/encryption has finished.
+                val result = RingProtocol.parseSuccessfulResponse(frame,
+                    RingProtocol.CMD_LO_PAIR_AUTH, 1)
+                ringPhoneAuthAccepted = result != null && result[0] == 0.toByte()
+                if (!ringPhoneAuthAccepted) ringHealthTransferFailed = true
+                monitor.signalAll()
+            }
+            if (ringHealthTransferActive && ringHealthStartFreshExpectedSeq >= 0
+                && frame.chan == RingProtocol.CHAN_DEVICE && frame.cmdHi == 0
+                && frame.cmdLo == ringHealthStartFreshExpectedCommand
+                && frame.seq == ringHealthStartFreshExpectedSeq
+                && RingProtocol.responseResult(frame.kind) != null) {
+                ringHealthStartFreshResponse = frame
+                monitor.signalAll()
+            }
+        }
         val status = RingProtocol.decodeDeviceStatus(frame)
         if (status != null) {
             monitor.withLock {
@@ -261,15 +548,19 @@ internal fun GlassesSessionCore.handleRingHealthNotification(characteristicUuid:
             }
             logLine("direct ring battery " + status.battery + "% charging=" + status.charging)
         }
+        recordStrictRingBindingResponse(frame)
         recordRingConfigResponse(frame)
         logDebug("ring device frame " + frame.describe())
         return true
     }
 
-    if (frame.kind == RingProtocol.KIND_RSP) {
+    if (RingProtocol.responseResult(frame.kind) != null) {
         logDebug("ring health rsp " + frame.describe())
         monitor.withLock {
-            ringHealthRspSeen = true
+            if (!ringHealthTransferActive || frame.cmdHi != ringHealthExpectedCommand
+                || frame.cmdLo != RingProtocol.CMD_LO_HEALTH || frame.seq != ringHealthExpectedSeq) return true
+            if (frame.kind == RingProtocol.KIND_RSP) ringHealthRspSeen = true
+            else ringHealthTransferFailed = true
             monitor.signalAll()
         }
         return true
@@ -277,6 +568,13 @@ internal fun GlassesSessionCore.handleRingHealthNotification(characteristicUuid:
     if (frame.kind != RingProtocol.KIND_DATA) {
         logDebug("ring health frame " + frame.describe())
         return true
+    }
+    if (host.ringHealthReadOnly() && monitor.withLock {
+            !ringHealthTransferActive || !ringPhoneAuthAccepted
+                || frame.cmdHi != ringHealthExpectedCommand || frame.cmdLo != RingProtocol.CMD_LO_HEALTH
+        }) {
+        failRingHealthTransfer()
+        return true  // retained in the journal, but no unsolicited/foreign page ACK
     }
 
     var record: RingProtocol.HealthRecord? = null
@@ -302,7 +600,8 @@ internal fun GlassesSessionCore.handleRingHealthNotification(characteristicUuid:
             ringHealthRecords.add(record)
             ringHealthTotalAdded++
         }
-        logLine("ring health " + record.summary())
+        // iOS shares diagnostic logs through Files; measurements stay in the private journal.
+        logLine("ring health " + if (host.ringHealthReadOnly()) frame.describe() else record.summary())
     }
 
     // Acknowledge the page regardless of whether we could decode it: the
@@ -333,8 +632,11 @@ internal fun GlassesSessionCore.queueRingPageAck(page: RingProtocol.Frame) {
 
 internal fun GlassesSessionCore.journalRingFrame(frame: RingProtocol.Frame): Boolean {
     return try {
+        val identity = monitor.withLock { ringHealthIdentity }
+        val identityField = if (identity == null) "" else ",\"ringId\":\"$identity\""
         host.appendRingFrameJournal(
-            "\n{\"receivedAtMs\":" + currentTimeMillis() + ",\"raw\":\"" + GlassesSessionCore.hex(frame.raw) + "\"}\n")
+            "\n{\"receivedAtMs\":" + currentTimeMillis() + identityField
+                + ",\"raw\":\"" + GlassesSessionCore.hex(frame.raw) + "\"}\n")
         true
     } catch (error: Throwable) {
         logLine("ring frame persistence failed; page not acknowledged: " + GlassesSessionCore.safeMessage(error))
@@ -349,13 +651,21 @@ internal fun GlassesSessionCore.journalRingFrame(frame: RingProtocol.Frame): Boo
  */
 internal fun GlassesSessionCore.onRingDataChannelReady() {
     try {
+        if (host.ringHealthReadOnly()) {
+            // A PHONE connection alone is not consent to drain ring history.
+            // Direct windows already consumed an explicit request; a permanent
+            // PHONE link's request is handled by runRequestedRingHealthPull.
+            if (monitor.withLock { ringHealthStartFreshActive }) runRingHealthStartFresh()
+            else if (monitor.withLock { ringHealthWindowActive }) runRingHealthPull()
+            return
+        }
         // The handshake mirrors what Even's own app repeats on every one
         // of its sync bursts (confirmed in the reference capture), so
         // sending it on every reconnect matches known-working behavior.
         // The actual health pull is throttled separately below - see
         // ringHealthLastRequestedAtMs and requestRingHealth()'s own
         // race-condition warning for why.
-        sendRingHandshake()
+        if (!sendRingHandshake()) return
         val now = now()
         val dueForHealthPull: Boolean
         val lastRequestedAtMs: Long
@@ -412,6 +722,7 @@ internal fun GlassesSessionCore.effectiveRingRoleLocked(): String =
  */
 internal fun GlassesSessionCore.beginRingHealthWindowLocked(now: Long, reason: String) {
     ringHealthWindowActive = true
+    ringHealthWindowIndependent = !sessionReady
     ringHealthWindowDeadlineMs = now + RING_HEALTH_WINDOW_CONNECT_TIMEOUT_MS
     // Counts as the attempt for the window floor whether or not it succeeds,
     // so a ring that never comes up in the phone role is retried at most
@@ -423,13 +734,15 @@ internal fun GlassesSessionCore.beginRingHealthWindowLocked(now: Long, reason: S
         ringRoleReconnectPending = true
     }
     monitor.signalAll()
-    logLine("ring health: opening a health window ($reason): direct link to the phone role for one pull")
+    logLine("ring health: opening a " + (if (ringHealthWindowIndependent) "no-glasses read-only " else "")
+        + "health window ($reason): direct link to the phone role for one pull")
 }
 
 /** Close a health window and put the link back in the glasses role. Caller holds `monitor`. */
 internal fun GlassesSessionCore.endRingHealthWindowLocked(reason: String) {
     if (!ringHealthWindowActive) return
     ringHealthWindowActive = false
+    ringHealthWindowIndependent = false
     ringHealthWindowDeadlineMs = 0L
     // Only a link that finished its phone-role setup has to be dropped; one
     // still connecting picks up the glasses role when it sets up.
@@ -442,13 +755,30 @@ internal fun GlassesSessionCore.endRingHealthWindowLocked(reason: String) {
 
 /** Ring-worker tick: give up on a health window whose phone-role link never came up. */
 internal fun GlassesSessionCore.expireRingHealthWindow() {
-    monitor.withLock {
+    val cancelPending = monitor.withLock {
         if (!ringHealthWindowActive || now() < ringHealthWindowDeadlineMs) return
-        lastRingHealthPullResult = "not run: phone-role link did not come up"
+        if (ringHealthStartFreshActive) {
+            ringHealthStartFreshActive = false
+            ringHealthStartFreshDeadlineMs = 0L
+            ringHealthStartFreshState = "failed"
+            lastRingHealthStartFreshResult = "phone-role link did not come up before the deadline"
+        } else {
+            lastRingHealthPullResult = "not run: phone-role link did not come up"
+        }
         lastRingHealthPullAtMs = now()
+        val cancel = ringConnectAttemptActive || ringBackgroundConnectPending ||
+            ringHealthWindowIndependent && ringConnected && !ringNotificationsReady
+        if (ringConnectAttemptActive || ringBackgroundConnectPending) {
+            ringConnectAttemptGeneration++
+            ringConnectAttemptActive = false
+            ringBackgroundConnectPending = false
+            rejectNextRingConnection = true
+        }
         endRingHealthWindowLocked("phone-role link not up after "
             + (RING_HEALTH_WINDOW_CONNECT_TIMEOUT_MS / 1000L) + "s")
+        cancel
     }
+    if (cancelPending) link.disconnect(ringAddress)
 }
 
 /**
@@ -459,6 +789,7 @@ internal fun GlassesSessionCore.expireRingHealthWindow() {
 private fun GlassesSessionCore.startRequestedRingHealthWindow() {
     val now = now()
     monitor.withLock {
+        expireQueuedRingHealthStartFreshLocked(now)
         if (!host.supportsRingHealth()) {
             ringHealthPullRequested = false
             return
@@ -469,13 +800,14 @@ private fun GlassesSessionCore.startRequestedRingHealthWindow() {
             return
         }
         val firstThisSession = ringHealthLastRequestedAtMs == 0L
-        if (!ringHealthPullRequested && !firstThisSession) return
-        // The ring is only dialed once the glasses session is up
-        // (shouldAttemptRingConnect); opening sooner would spend the
-        // window's connect deadline waiting on the glasses.
-        if (!running || !sessionReady) return
-        if (!firstThisSession && now - ringHealthLastRequestedAtMs < RING_HEALTH_WINDOW_MIN_INTERVAL_MS) {
-            ringHealthPullRequested = false
+        val freshStart = ringHealthStartFreshRequested
+        if (!freshStart && !ringHealthPullRequested && (host.ringHealthReadOnly() || !firstThisSession)) return
+        // Fresh recording still waits for glasses. Explicit read-only iOS
+        // retrieval may instead use the independently authorized window.
+        if (!running || freshStart && !sessionReady) return
+        if (!sessionReady && !(independentRingHealthEnabled && host.ringHealthReadOnly())) return
+        if (!freshStart && !firstThisSession && now - ringHealthLastRequestedAtMs < RING_HEALTH_WINDOW_MIN_INTERVAL_MS) {
+            if (!backgroundRingHealthActive) ringHealthPullRequested = false
             logLine("ring health: health window skipped, last pull attempt was "
                 + ((now - ringHealthLastRequestedAtMs) / 1000) + "s ago")
             return
@@ -484,7 +816,15 @@ private fun GlassesSessionCore.startRequestedRingHealthWindow() {
             return  // the ring is in use; try again on a later tick
         }
         ringHealthPullRequested = false
-        beginRingHealthWindowLocked(now, if (firstThisSession) "first pull this session" else "requested")
+        if (freshStart) {
+            ringHealthStartFreshRequested = false
+            ringHealthStartFreshActive = true
+            ringHealthStartFreshState = "running"
+        }
+        beginRingHealthWindowLocked(now, if (freshStart) "explicit fresh recording start"
+            else if (firstThisSession) "first pull this session" else "requested")
+        if (freshStart) ringHealthWindowDeadlineMs = minOf(ringHealthWindowDeadlineMs, ringHealthStartFreshDeadlineMs)
+        if (backgroundRingHealthActive) ringHealthWindowDeadlineMs = minOf(ringHealthWindowDeadlineMs, backgroundRingHealthDeadlineMs)
     }
 }
 
@@ -512,24 +852,36 @@ internal fun GlassesSessionCore.ringHealthPullDueLocked(now: Long): Boolean {
  * definition of "aborted".
  */
 internal fun GlassesSessionCore.runRingHealthPull() {
-    val pagesBefore = monitor.withLock { ringHealthPageCounter }
-    val completed = requestRingHealth()
-    monitor.withLock {
-        val pages = ringHealthPageCounter - pagesBefore
-        lastRingHealthPullResult = (if (completed) "completed" else "aborted") + ", $pages pages"
-        lastRingHealthPullAtMs = now()
-        if (completed) {
-            ringHealthAbortedRetries = 0
-        } else if (ringHealthAbortedRetries < RING_HEALTH_ABORTED_RETRY_LIMIT) {
-            ringHealthAbortedRetries++
-            logLine("ring health: aborted pull may resume in "
-                + (RING_HEALTH_ABORTED_RETRY_GAP_MS / 1000L) + "s (retry "
-                + ringHealthAbortedRetries + "/" + RING_HEALTH_ABORTED_RETRY_LIMIT + ")")
-        } else {
-            ringHealthAbortedRetries = 0
-            logLine("ring health: aborted pull retry budget spent, back to the "
-                + (RING_HEALTH_MIN_PULL_INTERVAL_MS / 60000L) + "-minute anti-spam floor")
+    val pullOwner = monitor.withLock {
+        ringHealthPageCounter to backgroundRingHealthGeneration.takeIf { backgroundRingHealthActive }
+    }
+    val pagesBefore = pullOwner.first
+    var completed = false
+    var readOnly = false
+    try {
+        readOnly = host.ringHealthReadOnly()
+        completed = if (readOnly) requestReadOnlyRingHealth() else requestRingHealth()
+    } finally {
+        val snapshot = monitor.withLock {
+            val pages = ringHealthPageCounter - pagesBefore
+            lastRingHealthPullResult = (if (completed) "completed" else "aborted") + ", $pages pages"
+            lastRingHealthPullAtMs = now()
+            if (completed || readOnly) {
+                ringHealthAbortedRetries = 0
+            } else if (ringHealthAbortedRetries < RING_HEALTH_ABORTED_RETRY_LIMIT) {
+                ringHealthAbortedRetries++
+                logLine("ring health: aborted pull may resume in "
+                    + (RING_HEALTH_ABORTED_RETRY_GAP_MS / 1000L) + "s (retry "
+                    + ringHealthAbortedRetries + "/" + RING_HEALTH_ABORTED_RETRY_LIMIT + ")")
+            } else {
+                ringHealthAbortedRetries = 0
+                logLine("ring health: aborted pull retry budget spent, back to the "
+                    + (RING_HEALTH_MIN_PULL_INTERVAL_MS / 60000L) + "-minute anti-spam floor")
+            }
+            pages to ringHealthTotalAdded
         }
+        emitRingHealthPullFinished(completed, snapshot.first, snapshot.second)
+        finishBackgroundRingHealth(if (completed) "completed" else "aborted", pullOwner.second)
     }
 }
 
@@ -542,6 +894,7 @@ internal fun GlassesSessionCore.runRingHealthPull() {
  * retried at all.
  */
 internal fun GlassesSessionCore.resumeAbortedRingHealthPull() {
+    if (host.ringHealthReadOnly()) return
     val now = now()
     monitor.withLock {
         if (ringHealthAbortedRetries == 0) {
@@ -563,10 +916,32 @@ internal fun GlassesSessionCore.resumeAbortedRingHealthPull() {
 
 /** Ring-worker side of [GlassesSessionCore.requestRingHealthNow]. */
 internal fun GlassesSessionCore.runRequestedRingHealthPull() {
+    if (!host.supportsRingHealth()) return
+    monitor.withLock { expireQueuedRingHealthStartFreshLocked(now()) }
+    val admitted = monitor.withLock {
+        !host.ringHealthReadOnly() || sessionReady || independentRingHealthEnabled
+    }
+    if (!admitted) {
+        monitor.withLock { ringHealthPullRequested = false }
+        return
+    }
     if (monitor.withLock { directRingRole == DIRECT_RING_ROLE_GLASSES }) {
         // Direct mode used to drop every request here, so the Health app
         // never got data; the pull has to borrow the phone role instead.
         startRequestedRingHealthWindow()
+        return
+    }
+    val runFresh = monitor.withLock {
+        if (host.ringHealthReadOnly() && !sessionReady || !ringHealthStartFreshRequested ||
+            !ringConnected || !ringNotificationsReady) false else {
+            ringHealthStartFreshRequested = false
+            ringHealthStartFreshActive = true
+            ringHealthStartFreshState = "running"
+            true
+        }
+    }
+    if (runFresh) {
+        runRingHealthStartFresh()
         return
     }
     val now = now()
@@ -574,17 +949,21 @@ internal fun GlassesSessionCore.runRequestedRingHealthPull() {
         if (!ringHealthPullRequested) {
             return
         }
-        ringHealthPullRequested = false
         if (!ringConnected || !ringNotificationsReady) {
-            logLine("ring health: on-demand pull skipped, ring not ready")
+            if (!host.ringHealthReadOnly()) ringHealthPullRequested = false
             return
         }
-        if (ringHealthLastRequestedAtMs != 0L
-                && now - ringHealthLastRequestedAtMs < RING_HEALTH_ON_DEMAND_MIN_INTERVAL_MS) {
-            logLine("ring health: on-demand pull skipped, last one was "
-                + ((now - ringHealthLastRequestedAtMs) / 1000) + "s ago")
+        val floorMs = if (backgroundRingHealthActive) RING_HEALTH_MIN_PULL_INTERVAL_MS
+            else RING_HEALTH_ON_DEMAND_MIN_INTERVAL_MS
+        if (ringHealthLastRequestedAtMs != 0L && now - ringHealthLastRequestedAtMs < floorMs) {
+            if (!backgroundRingHealthActive) {
+                ringHealthPullRequested = false
+                logLine("ring health: on-demand pull skipped, last one was "
+                    + ((now - ringHealthLastRequestedAtMs) / 1000) + "s ago")
+            }
             return
         }
+        ringHealthPullRequested = false
         ringHealthLastRequestedAtMs = now
     }
     logLine("ring health: on-demand pull requested")
@@ -606,7 +985,8 @@ internal fun GlassesSessionCore.runRequestedRingHealthPull() {
  * existing wire behavior until that migration is authorized and validated.
  * See notes/ring-health-live-validation.md for evidence and the next test.
  */
-internal fun GlassesSessionCore.sendRingHandshake() {
+internal fun GlassesSessionCore.sendRingHandshake(): Boolean {
+    if (host.ringHealthReadOnly()) return false
     val nowMs = currentTimeMillis()
     val utcOffsetMs = localUtcOffsetMs(nowMs)
     val clockOffsetSeconds = -utcOffsetMs / 1000L
@@ -655,10 +1035,11 @@ internal fun GlassesSessionCore.sendRingHandshake() {
     )
     for (frame in frames) {
         if (!writeRingFrame(frame, "handshake")) {
-            return
+            return false
         }
     }
     logLine("ring health: sent device-channel handshake (" + frames.size + " frames)")
+    return true
 }
 
 private fun le16(value: Int): ByteArray = byteArrayOf(value.toByte(), (value ushr 8).toByte())
@@ -721,6 +1102,226 @@ private fun le32(value: Long): ByteArray =
  * rather than relying on the ring loop's own call to it.
  */
 internal fun GlassesSessionCore.requestRingHealth(): Boolean {
+    if (host.ringHealthReadOnly() && monitor.withLock { !ringPhoneAuthAccepted }) return false
+    val ownsTransfer = monitor.withLock {
+        if (ringHealthTransferActive) false else {
+            beginRingHealthTransferLocked()
+            true
+        }
+    }
+    return try {
+        requestRingHealthTypes()
+    } finally {
+        if (ownsTransfer) monitor.withLock { endRingHealthTransferLocked() }
+    }
+}
+
+/** Authentication-only setup. Never changes clock, recording or binding configuration.
+ * Contract: openCFW r1/docs/correlation/CONNECTION-CONTROL-CORRELATION.md,
+ * and r1/src/application/runtime/native_protocol_control.c (r1_pair_role_handler).
+ */
+private fun GlassesSessionCore.requestReadOnlyRingHealth(): Boolean {
+    val auth = monitor.withLock {
+        if (!sessionReady && !independentRingHealthEnabled) return false
+        if (effectiveRingRoleLocked() != DIRECT_RING_ROLE_PHONE) return false
+        beginRingHealthTransferLocked()
+        ringPhoneAuthExpectedSeq = nextRingSeqLocked()
+        RingProtocol.buildPairAuth(ringPhoneAuthExpectedSeq)
+    }
+    return try {
+        if (!writeRingFrame(auth, "PHONE role auth")) return false
+        val deadline = now() + ringHealthRspTimeoutMs
+        while (true) {
+            val accepted = monitor.withLock {
+                if (!running || !ringConnected || ringHealthTransferStoppedLocked()) return false
+                if (ringPhoneAuthAccepted) true else {
+                    val remaining = minOf(deadline, ringHealthTransferDeadlineMs) - now()
+                    if (remaining <= 0) return false
+                    monitor.awaitMs(minOf(remaining, 100L))
+                    false
+                }
+            }
+            if (accepted) break
+        }
+        requestRingHealth()
+    } finally {
+        monitor.withLock { endRingHealthTransferLocked() }
+    }
+}
+
+private fun GlassesSessionCore.beginRingHealthTransferLocked() {
+    ringHealthTransferActive = true
+    ringHealthTransferFailed = false
+    ringHealthTransferDeadlineMs = if (ringHealthWindowActive) ringHealthWindowDeadlineMs
+        else now() + RING_HEALTH_WINDOW_CONNECT_TIMEOUT_MS
+    if (ringHealthStartFreshActive && ringHealthStartFreshDeadlineMs != 0L) {
+        ringHealthTransferDeadlineMs = minOf(ringHealthTransferDeadlineMs, ringHealthStartFreshDeadlineMs)
+    }
+    if (backgroundRingHealthActive) {
+        ringHealthTransferDeadlineMs = minOf(ringHealthTransferDeadlineMs, backgroundRingHealthDeadlineMs)
+    }
+    ringHealthExpectedCommand = -1
+    ringHealthExpectedSeq = -1
+    ringPhoneAuthExpectedSeq = -1
+    ringPhoneAuthAccepted = false
+}
+
+private fun GlassesSessionCore.endRingHealthTransferLocked() {
+    ringHealthTransferActive = false
+    ringHealthTransferDeadlineMs = 0L
+    ringHealthExpectedCommand = -1
+    ringHealthExpectedSeq = -1
+    ringPhoneAuthExpectedSeq = -1
+    ringPhoneAuthAccepted = false
+    ringHealthStartFreshExpectedCommand = -1
+    ringHealthStartFreshExpectedSeq = -1
+    ringHealthStartFreshResponse = null
+}
+
+/** Explicit, response-verified recording enable and UTC clock correction. */
+private fun GlassesSessionCore.runRingHealthStartFresh(): Boolean {
+    var result = "operation did not complete"
+    val completed = try {
+        val auth = monitor.withLock {
+            beginRingHealthTransferLocked()
+            ringPhoneAuthExpectedSeq = nextRingSeqLocked()
+            RingProtocol.buildPairAuth(ringPhoneAuthExpectedSeq)
+        }
+        if (!writeRingFrame(auth, "PHONE role auth") || !awaitRingPhoneAuth()) {
+            result = "R1 phone-role authentication was not acknowledged"
+            false
+        } else {
+            val before = readRingHealthSettings()
+            if (before == null) {
+                result = "R1 health settings could not be read before the change"
+                false
+            } else {
+                val utcSeconds = currentTimeMillis() / 1000L
+                val offsetMinutes = (localUtcOffsetMs(currentTimeMillis()) / 60_000L).toInt()
+                // Stock keeps the original settings timestamp when recording
+                // is already enabled; it only persists the supplied timestamp
+                // when the enabled flag changes.
+                val expectedSettingsTime = if (before.enabled) before.settingsTimeUtcSeconds else utcSeconds
+                val healthSet = monitor.withLock {
+                    RingProtocol.buildHealthSettingsSet(nextRingSeqLocked(), utcSeconds, true)
+                }
+                if (!writeFreshCommandAndAwait(healthSet, 0x0e, "health recording SET")) {
+                    result = "R1 did not acknowledge health recording enable"
+                    false
+                } else {
+                    val clockSet = monitor.withLock {
+                        RingProtocol.buildClockSet(nextRingSeqLocked(), offsetMinutes, utcSeconds)
+                    }
+                    if (!writeFreshCommandAndAwait(clockSet, 0x05, "UTC clock SET")) {
+                        result = "R1 did not acknowledge the UTC clock update"
+                        false
+                    } else {
+                        val after = readRingHealthSettings()
+                        if (after == null) {
+                            result = "R1 health settings could not be verified after the change"
+                            false
+                        } else if (!after.enabled) {
+                            result = "R1 reported health recording disabled after the change"
+                            false
+                        } else if (after.settingsTimeUtcSeconds != expectedSettingsTime) {
+                            result = "R1 settings timestamp did not match the requested UTC time"
+                            false
+                        } else {
+                            result = "recording enabled; clock acknowledged; settings time " +
+                                before.settingsTimeUtcSeconds + " to " + after.settingsTimeUtcSeconds
+                            true
+                        }
+                    }
+                }
+            }
+        }
+    } catch (error: Throwable) {
+        result = GlassesSessionCore.safeMessage(error)
+        false
+    } finally {
+        monitor.withLock { endRingHealthTransferLocked() }
+    }
+    monitor.withLock {
+        ringHealthStartFreshActive = false
+        ringHealthStartFreshDeadlineMs = 0L
+        ringHealthStartFreshState = if (completed) "succeeded" else "failed"
+        lastRingHealthStartFreshResult = result
+        monitor.signalAll()
+    }
+    logLine("ring health: fresh recording start " + if (completed) "succeeded: $result" else "failed: $result")
+    return completed
+}
+
+private fun GlassesSessionCore.expireQueuedRingHealthStartFreshLocked(now: Long) {
+    if (!ringHealthStartFreshRequested || ringHealthStartFreshDeadlineMs == 0L || now < ringHealthStartFreshDeadlineMs) return
+    ringHealthStartFreshRequested = false
+    ringHealthStartFreshActive = false
+    ringHealthStartFreshDeadlineMs = 0L
+    ringHealthStartFreshState = "failed"
+    lastRingHealthStartFreshResult = "R1 recording start expired before the phone-role window became ready"
+    monitor.signalAll()
+}
+
+private fun GlassesSessionCore.awaitRingPhoneAuth(): Boolean {
+    val deadline = now() + ringHealthRspTimeoutMs
+    while (true) {
+        monitor.withLock {
+            if (!running || !ringConnected || ringHealthTransferStoppedLocked()) return false
+            if (ringPhoneAuthAccepted) return true
+            val remaining = minOf(deadline, ringHealthTransferDeadlineMs) - now()
+            if (remaining <= 0) return false
+            monitor.awaitMs(minOf(remaining, 100L))
+        }
+    }
+}
+
+private fun GlassesSessionCore.readRingHealthSettings(): RingProtocol.HealthSettings? {
+    val frame = monitor.withLock { RingProtocol.buildHealthSettingsGet(nextRingSeqLocked()) }
+    val response = writeFreshCommandAndAwaitResponse(frame, 0x0e, "health settings GET") ?: return null
+    return RingProtocol.parseHealthSettingsResponse(response)
+}
+
+private fun GlassesSessionCore.writeFreshCommandAndAwait(frame: ByteArray, command: Int, label: String): Boolean {
+    val response = writeFreshCommandAndAwaitResponse(frame, command, label) ?: return false
+    return RingProtocol.parseSuccessfulResponse(response, command, 0) != null
+}
+
+private fun GlassesSessionCore.writeFreshCommandAndAwaitResponse(
+    frame: ByteArray,
+    command: Int,
+    label: String,
+): RingProtocol.Frame? {
+    val parsed = RingProtocol.parse(frame) ?: return null
+    monitor.withLock {
+        ringHealthStartFreshExpectedCommand = command
+        ringHealthStartFreshExpectedSeq = parsed.seq
+        ringHealthStartFreshResponse = null
+    }
+    if (!writeRingFrame(frame, label)) return null
+    val deadline = now() + ringHealthRspTimeoutMs
+    while (true) {
+        monitor.withLock {
+            if (!running || !ringConnected || ringHealthTransferStoppedLocked()) return null
+            val response = ringHealthStartFreshResponse
+            if (response != null) return if (response.kind == RingProtocol.KIND_RSP) response else null
+            val remaining = minOf(deadline, ringHealthTransferDeadlineMs) - now()
+            if (remaining <= 0) return null
+            monitor.awaitMs(minOf(remaining, 100L))
+        }
+    }
+}
+
+private fun GlassesSessionCore.failRingHealthTransfer() = monitor.withLock {
+    if (ringHealthTransferActive) {
+        ringHealthTransferFailed = true
+        monitor.signalAll()
+    }
+}
+
+private fun GlassesSessionCore.ringHealthTransferStoppedLocked(): Boolean =
+    ringHealthTransferActive && (ringHealthTransferFailed || now() >= ringHealthTransferDeadlineMs)
+
+private fun GlassesSessionCore.requestRingHealthTypes(): Boolean {
     // A previous attempt may have left an ACK queued after a failed write.
     // Never start another type's request ahead of that acknowledgement.
     if (flushRingOutbound() < 0) return false
@@ -730,7 +1331,9 @@ internal fun GlassesSessionCore.requestRingHealth(): Boolean {
         val command = commands[i]
         val frame = monitor.withLock {
             ringHealthRspSeen = false
-            RingProtocol.buildHealthRequest(command, nextRingSeqLocked(), nextRingNonceLocked())
+            ringHealthExpectedCommand = command
+            ringHealthExpectedSeq = nextRingSeqLocked()
+            RingProtocol.buildHealthRequest(command, ringHealthExpectedSeq, nextRingNonceLocked())
         }
         if (!writeRingFrame(frame, "health request 0x" + command.toString(16))) {
             // ABORTED: the sequence stopped partway. Distinct from "the
@@ -770,7 +1373,7 @@ internal fun GlassesSessionCore.requestRingHealth(): Boolean {
     //
     // An RSP with no DATA remains ambiguous per type and is NOT treated as
     // a failure here - that is the ordinary "nothing new" case.
-    val stillConnected = monitor.withLock { ringConnected }
+    val stillConnected = monitor.withLock { ringConnected && !ringHealthTransferStoppedLocked() }
     if (!stillConnected || rspCount == 0) {
         logLine("ring health: pull ABORTED - ran all " + commands.size + " types but "
             + (if (stillConnected) "the ring answered none of them" else "the link dropped"))
@@ -780,9 +1383,7 @@ internal fun GlassesSessionCore.requestRingHealth(): Boolean {
     return true
 }
 
-/** Block (ring worker) until the health RSP flag is set or the timeout
- * elapses. Not correlated to a specific command/seq - like the rest of
- * this protocol's request path, it trusts the ring answers in order. */
+/** Block until the expected command/sequence responds successfully, or abort/timeout. */
 internal fun GlassesSessionCore.awaitRingHealthRsp(timeoutMs: Long): Boolean {
     val deadline = now() + timeoutMs
     while (true) {
@@ -790,10 +1391,10 @@ internal fun GlassesSessionCore.awaitRingHealthRsp(timeoutMs: Long): Boolean {
         // outside the lock so GATT callbacks can continue delivering pages.
         if (flushRingOutbound() < 0) return false
         monitor.withLock {
-            if (!running || !ringConnected) return false
+            if (!running || !ringConnected || ringHealthTransferStoppedLocked()) return false
             if (ringHealthRspSeen) return true
             if (ringOutbound.isEmpty()) {
-                val remaining = deadline - now()
+                val remaining = minOf(deadline, ringHealthTransferDeadlineMs) - now()
                 if (remaining <= 0) {
                     return false
                 }
@@ -817,17 +1418,21 @@ internal fun GlassesSessionCore.awaitRingHealthDataIdle(idleMs: Long): Boolean {
         val acknowledged = flushRingOutbound()
         if (acknowledged < 0) return false
         monitor.withLock {
-            if (!running || !ringConnected) return false
+            if (!running || !ringConnected || ringHealthTransferStoppedLocked()) return false
             if (acknowledged > 0 || ringHealthPageCounter != lastSeenCounter) {
                 lastSeenCounter = ringHealthPageCounter
                 // Start the next-page window AFTER the blocking ACK write.
                 idleDeadline = now() + idleMs
             }
             // A callback may have queued a page between flush and lock.
-            if (ringOutbound.isEmpty()) {
-                val remaining = idleDeadline - now()
-                if (remaining <= 0) return true
+            if (ringOutbound.isEmpty() && ringHealthIntakeInFlight == 0) {
+                val remaining = (if (ringHealthTransferActive)
+                    minOf(idleDeadline, ringHealthTransferDeadlineMs) else idleDeadline) - now()
+                if (remaining <= 0) return !ringHealthTransferStoppedLocked()
                 monitor.awaitMs(minOf(remaining, 100L))
+            } else if (ringHealthIntakeInFlight != 0) {
+                monitor.awaitMs(if (ringHealthTransferActive)
+                    minOf(100L, ringHealthTransferDeadlineMs - now()).coerceAtLeast(1L) else 100L)
             }
         }
     }
@@ -861,13 +1466,19 @@ internal fun GlassesSessionCore.writeRingFrame(
     if (blockedForMs > 0) {
         return false
     }
+    val timeoutMs = monitor.withLock {
+        if (ringHealthTransferStoppedLocked()) return false
+        if (ringHealthTransferActive) minOf(ConnectionOptions.WRITE_TIMEOUT_MS.toLong(),
+            ringHealthTransferDeadlineMs - now()).coerceAtLeast(1L).toInt()
+        else ConnectionOptions.WRITE_TIMEOUT_MS
+    }
     val ok = try {
         val written = link.writeFrames(
             ringAddress,
             characteristicUuid,
             listOf(frame),
             ConnectionOptions.WRITE_MODE,
-            ConnectionOptions.WRITE_TIMEOUT_MS
+            timeoutMs
         )
         if (!written) {
             logLine("ring $what write failed")
@@ -887,7 +1498,20 @@ internal fun GlassesSessionCore.writeRingFrame(
             logLine("ring writes paused for " + backoffMs + "ms after " + ringWriteFailures + " consecutive failure(s)")
         }
     }
-    return ok
+    return ok && monitor.withLock { !ringHealthTransferStoppedLocked() }
+}
+
+/** Remaining end-to-end health budget, also used by connect/CCCD operations. */
+internal fun GlassesSessionCore.ringOperationTimeoutMs(defaultMs: Int): Int = monitor.withLock {
+    val deadline = when {
+        ringHealthTransferActive -> ringHealthTransferDeadlineMs
+        ringHealthWindowActive -> ringHealthWindowDeadlineMs
+        backgroundRingHealthActive -> backgroundRingHealthDeadlineMs
+        else -> return defaultMs
+    }
+    val remaining = deadline - now()
+    check(remaining > 0) { "ring health deadline expired" }
+    minOf(defaultMs.toLong(), remaining).toInt()
 }
 
 /**
@@ -898,7 +1522,7 @@ internal fun GlassesSessionCore.flushRingOutbound(): Int {
     var acknowledged = 0
     while (true) {
         val frame = monitor.withLock {
-            if (!ringNotificationsReady) return -1
+            if (!ringNotificationsReady || ringHealthTransferStoppedLocked()) return -1
             ringOutbound.firstOrNull() ?: return acknowledged
         }
         if (!writeRingFrame(frame, "page ack")) return -1
@@ -954,6 +1578,15 @@ internal fun macWireBytes(address: String): ByteArray? {
     return bytes
 }
 
+internal fun canonicalRingIdFromWire(mac: ByteArray?): String? {
+    if (mac == null || mac.size != 6 || mac.all { it.toInt() == 0 }) return null
+    val digits = "0123456789ABCDEF"
+    return (5 downTo 0).joinToString(":") { index ->
+        val value = mac[index].toInt() and 0xff
+        "" + digits[value ushr 4] + digits[value and 0x0f]
+    }
+}
+
 /**
  * Queue one ring-link command to both temples (only the ring-owning temple
  * acts on a connect; either may hold the link). Actions:
@@ -986,6 +1619,10 @@ internal fun GlassesSessionCore.queueGlassesRingLinkCommandLocked(
     }
     val name = (if (reported != null && glassesRingName.isNotEmpty()) glassesRingName else fallbackName)
         .encodeToByteArray()
+    if (mac.size != 6 || (action == "connect" || action == "release") && name.size > 16) {
+        logLine("glasses ring command skipped: identity exceeds firmware limits")
+        return false
+    }
     val macSource = if (reported != null) "glasses-reported" else "configured"
     lastRingLinkCommand = "$action mac=${GlassesSessionCore.hex(mac)} ($macSource)"
     lastRingLinkCommandAtMs = now()
@@ -1021,12 +1658,16 @@ internal fun GlassesSessionCore.queueGlassesRingLinkCommandLocked(
  * both carrying the ring MAC in the glasses' byte order. Acks to our own
  * commands are skipped for the MAC so it never just echoes our guess.
  */
-internal fun GlassesSessionCore.recordGlassesRingReportLocked(frame: BleProtocol.ParsedFrame, address: String) {
+internal fun GlassesSessionCore.recordGlassesRingReportLocked(
+    frame: BleProtocol.ParsedFrame,
+    address: String,
+): Pair<Boolean, String>? {
     val report = if (frame.sid == BleProtocol.SID_RING_DATA) BleProtocol.parseRingDataEvent(frame.pb)
         else BleProtocol.parseRingConnectInfo(frame.pb)
-    if (report == null) return
+    if (report == null) return null
     val arm = if (address.equals(leftAddress, ignoreCase = true)) "L" else "R"
     val ownAck = inFlightMessages.any { it.sid == frame.sid && it.magic == frame.msgSeq }
+    val protocolNotification = frame.flag == BleProtocol.FLAG_NOTIFY || frame.flag == BleProtocol.FLAG_NOTIFY_ALT
     val mac = report.ringMac
     lastGlassesRingReport = report.source + " " + arm + " code=" + report.code +
         (if (mac != null) " mac=" + GlassesSessionCore.hex(mac) else "") +
@@ -1038,9 +1679,12 @@ internal fun GlassesSessionCore.recordGlassesRingReportLocked(frame: BleProtocol
         if (report.ringName.isNotEmpty()) glassesRingName = report.ringName
     }
     logLine("glasses ring report: $lastGlassesRingReport")
+    val reportedRingId = canonicalRingIdFromWire(mac)
     if (!ownAck && frame.sid != BleProtocol.SID_RING_DATA && report.code == 0) {
         releaseRingFromGlassesLocked("glasses connected the ring")
     }
+    return if (protocolNotification && !ownAck && frame.sid != BleProtocol.SID_RING_DATA && reportedRingId != null)
+        (report.code == 0) to reportedRingId else null
 }
 
 // ---------------------------------------------------------------------------
@@ -1056,6 +1700,181 @@ internal fun GlassesSessionCore.recordGlassesRingReportLocked(frame: BleProtocol
 
 internal const val DIRECT_RING_ROLE_PHONE = "phone"
 internal const val DIRECT_RING_ROLE_GLASSES = "glasses"
+
+private fun validHardwareMacWire(value: String): ByteArray? {
+    val wire = macWireBytes(value) ?: return null
+    if (wire.all { it.toInt() == 0 } || wire.all { (it.toInt() and 0xff) == 0xff }) return null
+    return wire
+}
+
+internal fun GlassesSessionCore.bindRingToGlassesOnWorker(
+    rightHardwareMac: String,
+    leftHardwareMac: String,
+    ringHardwareMac: String,
+    ringName: String,
+    timeoutMs: Int,
+    reservation: Long,
+): String {
+    if (reservation < 0L) return "failed: binding already in progress"
+    if (ringName.encodeToByteArray().size > 16) return "failed: ring name exceeds firmware limit"
+    val rightWire = validHardwareMacWire(rightHardwareMac) ?: return "failed: invalid right glasses address"
+    val leftWire = validHardwareMacWire(leftHardwareMac) ?: return "failed: invalid left glasses address"
+    val ringWire = validHardwareMacWire(ringHardwareMac) ?: return "failed: invalid ring address"
+    val rightId = canonicalRingIdFromWire(rightWire)!!
+    val leftId = canonicalRingIdFromWire(leftWire)!!
+    val ringId = canonicalRingIdFromWire(ringWire)!!
+    if (rightId == leftId || rightId == ringId || leftId == ringId) return "failed: hardware addresses must be distinct"
+    val generation = monitor.withLock {
+        if (reservation != ringBindingGeneration) return "failed: cancelled before start"
+        if (!isG2 || !running || !sessionReady) return "failed: glasses session not ready"
+        if (directRingRole != DIRECT_RING_ROLE_PHONE) return "failed: ring is not in Health mode"
+        if (ringBindingActive) return "failed: binding already in progress"
+        if (ringHealthIdentity != null && ringHealthIdentity != ringId) return "failed: ring identity mismatch"
+        val reported = canonicalRingIdFromWire(glassesRingMac)
+        if (reported != null && reported != ringId) return "failed: glasses reported a different ring"
+        ringBindingDeadlineMs = ringBindingReservationDeadlineMs
+        if (now() >= ringBindingDeadlineMs) return "failed: timed out"
+        ringBindingActive = true
+        ringBindingResult = null
+        ringBindingRightWire = rightWire
+        ringBindingLeftWire = leftWire
+        ringBindingRingId = ringId
+        ringBindingRingName = ringName
+        ringBindingExpectedSeq = -1
+        ringBindingExpectedCommand = -1
+        ringBindingResponse = null
+        monitor.signalAll()
+        reservation
+    }
+    interruptibleSleep.interrupt()
+    return monitor.withLock {
+        while (ringBindingActive && generation == ringBindingGeneration) {
+            val left = ringBindingDeadlineMs - now()
+            if (left <= 0L) {
+                ringBindingGeneration++
+                finishRingBindingLocked("failed: timed out")
+                break
+            }
+            monitor.awaitMs(left)
+        }
+        ringBindingResult ?: "failed: cancelled"
+    }
+}
+
+internal fun GlassesSessionCore.cancelRingBindingOperation(reason: String): Boolean = monitor.withLock {
+    var changed = false
+    ringBindingGeneration++
+    for (message in ringBindingQueuedConnectMessages) {
+        if (pendingMessages.remove(message)) changed = true
+    }
+    ringBindingQueuedConnectMessages.clear()
+    if (ringBindingActive) {
+        finishRingBindingLocked(reason)
+        changed = true
+    }
+    changed
+}
+
+private fun GlassesSessionCore.finishRingBindingLocked(result: String) {
+    ringBindingActive = false
+    ringBindingExpectedSeq = -1
+    ringBindingExpectedCommand = -1
+    ringBindingResponse = null
+    ringBindingResult = result
+    monitor.signalAll()
+}
+
+internal fun GlassesSessionCore.recordStrictRingBindingResponse(frame: RingProtocol.Frame) {
+    monitor.withLock {
+        if (!ringBindingActive || frame.seq != ringBindingExpectedSeq || frame.cmdLo != ringBindingExpectedCommand ||
+            frame.cmdHi != RingProtocol.CMD_HI_DEVICE) return
+        ringBindingResponse = frame
+        monitor.signalAll()
+    }
+}
+
+private fun GlassesSessionCore.awaitStrictRingBindingResponse(
+    generation: Long,
+    seq: Int,
+    command: Int,
+): RingProtocol.Frame? = monitor.withLock {
+    while (ringBindingActive && generation == ringBindingGeneration && ringBindingResponse == null) {
+        val left = ringBindingDeadlineMs - now()
+        if (left <= 0L) return null
+        monitor.awaitMs(left)
+    }
+    if (!ringBindingActive || generation != ringBindingGeneration || ringBindingExpectedSeq != seq ||
+        ringBindingExpectedCommand != command) null else ringBindingResponse
+}
+
+internal fun GlassesSessionCore.processRingBindingOperation(): Boolean {
+    val generation = monitor.withLock {
+        if (!ringBindingActive) return false
+        if (now() >= ringBindingDeadlineMs) {
+            finishRingBindingLocked("failed: timed out")
+            return true
+        }
+        if (!running || !sessionReady || directRingRole != DIRECT_RING_ROLE_PHONE) {
+            finishRingBindingLocked("failed: mode changed")
+            return true
+        }
+        if (!ringConnected || !ringNotificationsReady) return false
+        ringBindingGeneration
+    }
+    fun runStep(frame: ByteArray, seq: Int, command: Int, label: String): RingProtocol.Frame? {
+        monitor.withLock {
+            if (!ringBindingActive || generation != ringBindingGeneration) return null
+            ringBindingExpectedSeq = seq
+            ringBindingExpectedCommand = command
+            ringBindingResponse = null
+        }
+        if (!writeRingFrame(frame, label)) return null
+        return awaitStrictRingBindingResponse(generation, seq, command)
+    }
+    val authSeq = monitor.withLock { nextRingSeqLocked() }
+    val auth = runStep(
+        RingProtocol.buildPairAuth(authSeq),
+        authSeq,
+        RingProtocol.CMD_LO_PAIR_AUTH,
+        "PHONE role auth for glasses binding",
+    )
+    val authArgs = RingProtocol.parseSuccessfulResponse(auth, RingProtocol.CMD_LO_PAIR_AUTH, 1)
+    if (authArgs == null || authArgs[0] != 0.toByte()) {
+        monitor.withLock { if (generation == ringBindingGeneration) finishRingBindingLocked("failed: ring authentication rejected") }
+        return true
+    }
+    val adv = monitor.withLock {
+        val seq = nextRingSeqLocked()
+        seq to RingProtocol.buildAdvStart(seq, ringBindingRightWire, ringBindingLeftWire)
+    }
+    val advResponse = runStep(adv.second, adv.first, RingProtocol.CMD_LO_ADV_START, "advStart known G2 targets")
+    if (advResponse == null) {
+        monitor.withLock { if (generation == ringBindingGeneration) finishRingBindingLocked("failed: timed out") }
+        return true
+    }
+    if (RingProtocol.parseSuccessfulResponse(advResponse, RingProtocol.CMD_LO_ADV_START, 0) == null) {
+        monitor.withLock { if (generation == ringBindingGeneration) finishRingBindingLocked("failed: ring rejected glasses targets") }
+        return true
+    }
+    monitor.withLock {
+        val reported = canonicalRingIdFromWire(glassesRingMac)
+        if (!ringBindingActive || generation != ringBindingGeneration || now() > ringBindingDeadlineMs ||
+            !running || !sessionReady || directRingRole != DIRECT_RING_ROLE_PHONE ||
+            !ringConnected || !ringNotificationsReady || reported != null && reported != ringBindingRingId) {
+            if (generation == ringBindingGeneration) finishRingBindingLocked("failed: cancelled")
+            return true
+        }
+        val before = pendingMessages.toList()
+        val queued = queueGlassesRingLinkCommandLocked("connect", ringBindingRingId, ringBindingRingName)
+        if (queued) {
+            ringBindingQueuedConnectMessages.clear()
+            ringBindingQueuedConnectMessages.addAll(pendingMessages.filter { it !in before })
+        }
+        finishRingBindingLocked(if (queued) "glasses-connect-queued" else "failed: glasses connect could not be queued")
+    }
+    interruptibleSleep.interrupt()
+    return true
+}
 
 /** How long a command with a follow-up waits for the ring's answer before running it anyway. */
 private const val RING_CONFIG_RESPONSE_TIMEOUT_MS = 3_000L
@@ -1207,6 +2026,22 @@ internal fun GlassesSessionCore.recordRingConfigResponse(frame: RingProtocol.Fra
  * worker only.
  */
 internal fun GlassesSessionCore.restartRingLinkForRoleChange() {
+    val leavingGlassesForHealth = monitor.withLock {
+        ringRoleReconnectPending && ringHealthWindowActive && ringNotificationsReady
+            && directRingRole == DIRECT_RING_ROLE_GLASSES && host.ringHealthReadOnly()
+    }
+    if (leavingGlassesForHealth && !enableRingNotification(BleProtocol.R1_LEGACY_NOTIFY_CHAR_UUID, false)) {
+        // Do not reconnect as PHONE with a possibly restored GLASSES CCCD.
+        // If restoring notifications also fails, reconnect only as GLASSES.
+        monitor.withLock {
+            endRingHealthWindowLocked("legacy notification disable failed")
+            lastRingHealthPullResult = "aborted: legacy notification disable failed"
+            lastRingHealthPullAtMs = now()
+        }
+        val restored = enableRingNotification(BleProtocol.R1_LEGACY_NOTIFY_CHAR_UUID)
+        monitor.withLock { ringRoleReconnectPending = !restored }
+        if (restored) return
+    }
     val role = monitor.withLock {
         if (!ringRoleReconnectPending) return
         ringRoleReconnectPending = false

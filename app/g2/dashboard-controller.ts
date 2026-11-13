@@ -476,6 +476,8 @@ class DashboardController {
       // Apply a firmware-debug-flags toggle live while connected (Java dedups).
       this.pushFirmwareDebugFlags();
       this.pushBrightness();
+      void this.communicator?.setHeadUpEnabled(this.glance.allowsHeadTilt())
+        .catch(error => this.appendLog(`Head-up policy: ${String(error)}`));
       this.syncEvenHubScreenOffSetting();
       this.syncVoiceWake();
       // Display mode size first: a reflow repositions every surface too, so
@@ -1575,6 +1577,7 @@ class DashboardController {
       // The paired glasses' screen: the G2's 640x480 or the RayNeo iO's 540x220.
       await communicator.configureCompositorScreen(screenWidth(), screenHeight());
       await communicator.configureBrightness(getBrightnessPreferences());
+      await communicator.setHeadUpEnabled(this.glance.allowsHeadTilt());
       this.voiceWakeSent = null;
       this.syncVoiceWake(communicator);
       this.offState = communicator.onStateChange((state) => {
@@ -2432,6 +2435,8 @@ class DashboardController {
     try {
       const inputEvent = rawInputEventToInputEvent(event);
       if (!acceptInput(inputEvent)) return;
+      if (event.kind === "display-wake" && event.eventType === OsEventTypeList.HEAD_UP_EVENT
+        && !this.glance.allowsHeadTilt()) return;
       // The gesture, plus which app is on screen and whether input goes to it,
       // the sidebar, or a shell overlay. Java only knows the raw event codes,
       // and without the target the export says what was pressed but not who
@@ -2484,7 +2489,9 @@ class DashboardController {
       let shellPreWoke = false;
       if (wakewordShouldWake || displayShouldWake) {
         if (!shell.isScreenOn()) {
-          shellPreWoke = shell.wake(displayShouldWake ? shell.userWakeFocus() : "sidebar");
+          shellPreWoke = shell.wake(displayShouldWake
+            ? event.eventType === OsEventTypeList.HEAD_UP_EVENT ? "window" : shell.userWakeFocus()
+            : "sidebar");
         }
         if (shellPreWoke || this.evenHubSessionSuspended || this.evenHubResumePromise) {
           const ready = await frameTimings.spanAsync(frameId, "wake-barrier", () =>

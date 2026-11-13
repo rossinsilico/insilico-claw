@@ -3,8 +3,8 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs'), vm = require('node:vm'), ts = require('typescript');
 
 // dashboard-settings.ts over an in-memory settings store (as in brightness-curve.test.cjs).
-function settingsFixture(store = new Map()) {
-  const context = { exports: {}, global: { isIOS: false }, require: id => {
+function settingsFixture(store = new Map(), isIOS = false) {
+  const context = { exports: {}, global: { isIOS }, require: id => {
     if (id.includes('settings-store')) return {
       onSettingsStoreChanged() {}, getStringSetting: (k, d) => store.get(k) ?? d,
       setStringSetting: (k, v) => store.set(k, v),
@@ -94,6 +94,16 @@ test('a RayNeo iO defaults the app switcher to the left, and keeps a chosen posi
   assert.equal(api.appSwitcherPositionSetting.get(), 'left');
 });
 
+test('status items stay out of app-switcher navigation by default and retain an explicit opt-in', () => {
+  const store = new Map();
+  const api = settingsFixture(store);
+  assert.equal(api.appSwitcherIncludeStatusBarSetting.get(), false);
+  assert.equal(store.has('display.appSwitcherIncludeStatusBar'), false);
+  api.appSwitcherIncludeStatusBarSetting.set(true);
+  assert.equal(api.appSwitcherIncludeStatusBarSetting.get(), true);
+  assert.equal(store.get('display.appSwitcherIncludeStatusBar'), true);
+});
+
 test('a RayNeo iO always takes the R1 directly, leaving the G2\'s ring connection setting alone', () => {
   const store = new Map();
   const api = settingsFixture(store);
@@ -105,6 +115,26 @@ test('a RayNeo iO always takes the R1 directly, leaving the G2\'s ring connectio
   assert.equal(api.ringConnectionModeSetting.get(), 'health');
   api.glassesTypeSetting.set('g2');
   assert.equal(api.effectiveRingConnectionMode(), 'health');
+});
+
+test('iOS explains the three ring routes without experimental or transfer-slot claims', () => {
+  const ios = settingsFixture(new Map(), true).ringConnectionModeSetting.description;
+  assert.match(ios, /Only via glasses.*controls.*G2.*no R1 health link/i);
+  assert.match(ios, /Via glasses \+ health sync.*controls.*G2.*health.*separate R1-to-iPhone link/i);
+  assert.match(ios, /Direct to phone.*iPhone handles both.*health sync.*pause controls/i);
+  assert.match(ios, /Casing does not change the selected mode.*worn-only gates controls rather than health/i);
+  assert.match(ios, /after reconnect/i);
+  assert.doesNotMatch(ios, /experimental|:01|:31|minute/i);
+  assert.match(settingsFixture().ringConnectionModeSetting.description, /experimental/);
+});
+
+test('ring controls require confirmed wear by default and retain an explicit override', () => {
+  const store = new Map();
+  const api = settingsFixture(store);
+  assert.equal(api.ringControlsOnlyWhileWornSetting.get(), true);
+  api.ringControlsOnlyWhileWornSetting.set(false);
+  assert.equal(store.get('ring.controlsOnlyWhileWorn'), false);
+  assert.equal(api.ringControlsOnlyWhileWornSetting.get(), false);
 });
 
 test('only a G2 has a compass', () => {

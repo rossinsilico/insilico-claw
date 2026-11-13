@@ -10,6 +10,11 @@ function harness(refused = new Set()) {
   const surfaces = new Set();
   const session = {
     setRequiredFirmwareRevisionRevision() {}, setListenerListener() {}, setPreviewAnimationListenerListener() {},
+    setHeadUpEnabledEnabled(enabled) { calls.push(['head-up', enabled]); },
+    readHeadUpAngle() { calls.push(['read-angle']); return 30; },
+    setHeadUpAngleAngle(angle) { calls.push(['angle', angle]); return true; },
+    readHeadUpAngleCompletion(completion) { calls.push(['read-angle']); completion(30); },
+    setHeadUpAngleAngleCompletion(angle, completion) { calls.push(['angle', angle]); completion(true); },
     configureSurfaceIdXYWidthHeightZOrderTransparency(id) {
       calls.push(['configure', id]);
       if (refused.has(id)) return false;
@@ -52,11 +57,55 @@ function harness(refused = new Set()) {
       next.ran = true; next.fn();
     }
   }
-  return { bridge, calls, drain };
+  return { bridge, calls, drain, session };
 }
 
 const rect = { x: 0, y: 0, width: 2, height: 1 };
 const options = { x: 0, y: 0, width: 2, height: 1, zOrder: 0, transparency: 'opaque' };
+
+test('head-up policy uses the exported native setter through the existing call queue', async () => {
+  const h = harness();
+  const changed = h.bridge.setHeadUpEnabled(false);
+  await h.drain(); await changed;
+  assert.deepEqual(h.calls, [['head-up', false]]);
+});
+
+test('device angle uses native readback and rejects fractional or out-of-range writes', async () => {
+  const h = harness();
+  const read = h.bridge.readHeadUpAngle(); await h.drain(); assert.equal(await read, 30);
+  for (const angle of [0, 60]) {
+    const changed = h.bridge.setHeadUpAngle(angle); await h.drain(); assert.equal(await changed, true);
+  }
+  for (const angle of [-1, 61, 1.5, NaN]) assert.equal(await h.bridge.setHeadUpAngle(angle), false);
+  assert.deepEqual(h.calls, [['read-angle'], ['angle', 0], ['angle', 60]]);
+});
+
+test('waiting for angle readback leaves display calls responsive and stale queued writes never reach native', async () => {
+  const h = harness();
+  let finishRead;
+  h.session.readHeadUpAngleCompletion = completion => { finishRead = completion; };
+  const read = h.bridge.readHeadUpAngle();
+  await h.drain();
+  assert.equal(typeof finishRead, 'function');
+  const display = h.bridge.configureSurface('live', options);
+  await h.drain(); await display;
+  assert.deepEqual(h.calls, [['configure', 'live']]);
+  finishRead(30); assert.equal(await read, 30);
+  let stillCurrent = true;
+  const changed = h.bridge.setHeadUpAngle(45, () => stillCurrent);
+  stillCurrent = false;
+  await h.drain(); assert.equal(await changed, false);
+  assert.deepEqual(h.calls, [['configure', 'live']]);
+});
+
+test('PHONE ring readiness uses the existing asynchronous subscription and honors removal', async () => {
+  const h = harness(); let calls = 0;
+  const off = h.bridge.onPhoneRingReady(() => calls++);
+  h.bridge.handlePhoneRingReady(); assert.equal(calls, 0);
+  await h.drain(); assert.equal(calls, 1);
+  h.bridge.handlePhoneRingReady(); off(); await h.drain();
+  assert.equal(calls, 1);
+});
 
 test('a frame queued behind its surface removal is dropped instead of reaching Kotlin', async () => {
   const h = harness();

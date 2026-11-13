@@ -1,10 +1,18 @@
 import { readUpcomingEventsAsync, type CalendarEvent } from "../native/calendar";
 import { hasCalendarPermission } from "../native/calendar-permissions";
+import { getCurrentLocation } from "../native/location";
 import { mediaControllerBridge } from "../native/media-controller";
 import { spotifyService } from "../native/spotify";
-import { dismissNotification, readActiveNotifications } from "../native/notification-icons";
+import {
+  ALL_NOTIFICATIONS,
+  dismissNotification,
+  isNotificationRelayReady,
+  notificationRelayMessage,
+  readActiveNotifications,
+} from "../native/notification-icons";
 import { shell } from "../ui/shell/shell";
 import { toolRegistry, type ToolRegistry, type ToolResult } from "./tool-registry";
+import { registerHealthTools } from "./health-tools";
 
 /**
  * Registers the always-available system tools into the registry. Called once at
@@ -20,9 +28,26 @@ let registered = false;
 export function registerSystemTools(registry: ToolRegistry = toolRegistry): void {
   if (registered) return;
   registered = true;
+  if (global.isIOS) registerHealthTools(registry);
 
   // Keep a media listener warm so "what's playing" works without opening Music.
   void mediaControllerBridge.start();
+
+  registry.registerSystemTool(
+    {
+      name: "location.current",
+      description: "Get one current location fix from this phone's GPS, including accuracy and timestamp.",
+      inputSchema: { type: "object", properties: {}, additionalProperties: false },
+    },
+    async () => {
+      try {
+        const location = await getCurrentLocation();
+        return ok(JSON.stringify({ ...location, source: "phone-gps" }));
+      } catch (error) {
+        return err(`Phone location unavailable: ${String((error as Error)?.message ?? error)}`);
+      }
+    },
+  );
 
   registry.registerSystemTool(
     {
@@ -170,43 +195,76 @@ export function registerSystemTools(registry: ToolRegistry = toolRegistry): void
     });
   }
 
-  // Android notification tools are still platform-specific.
-  if (global.isIOS) return;
-
+  // iOS matches AncsClient's MAX_ACTIVE cache capacity; Android keeps its existing bound.
+  const notificationLimit = global.isIOS ? 128 : 50;
   registry.registerSystemTool(
     {
       name: "notifications.list",
-      description: "List the user's current Android notifications mirrored to the glasses.",
+      description: global.isIOS
+        ? "List the user's current iPhone notifications relayed to Faceclaw on the glasses, with listed/total counts and hasMore. When the user explicitly asks to hide all current notifications, use max 128 and pass all returned keys in one notifications.dismiss batch. For a subset request, target only that subset."
+        : "List the user's current Android notifications mirrored to the glasses.",
       inputSchema: {
         type: "object",
-        properties: { max: { type: "number", description: "Maximum notifications to return (default 10)." } },
+        properties: { max: { type: "number", minimum: 1, maximum: notificationLimit,
+          description: `Maximum notifications to return (default 10, limit ${notificationLimit}).` } },
         additionalProperties: false,
       },
     },
     (args) => {
-      const max = clampNumber(args?.max, 1, 50, 10);
-      const notifications = readActiveNotifications(max);
-      if (!notifications.length) return ok("No current notifications.");
-      return ok(notifications.map(formatNotification).join("\n"));
+      if (global.isIOS && !isNotificationRelayReady()) return err(notificationRelayMessage());
+      const max = clampNumber(args?.max, 1, notificationLimit, 10);
+      const all = readActiveNotifications(ALL_NOTIFICATIONS);
+      const notifications = all.slice(0, max);
+      const counts = JSON.stringify({ listed: notifications.length, total: all.length, hasMore: notifications.length < all.length });
+      return ok(`${counts}\n${notifications.length ? notifications.map(formatNotification).join("\n") : "No current notifications."}`);
     },
   );
 
   registry.registerSystemTool(
     {
       name: "notifications.dismiss",
-      description:
-        "Dismiss a notification by its key (as returned by notifications.list). Returns whether it was dismissed.",
+      description: global.isIOS
+        ? "Hide iPhone notifications from Faceclaw on the glasses. When explicitly asked to hide all current notifications, list with max 128 and pass all returned keys in one keys array (up to 128). For a subset request, target only that subset. Use key for one notification. The batch receipt reports remaining current notifications; do not claim the tray is empty unless remaining is zero. This does not dismiss them from iPhone Notification Center or perform a notification action."
+        : "Dismiss notifications by keys returned by notifications.list. For multiple notifications, pass all their listed keys in one keys array (up to 50), not separate tool calls. Use key for one notification. Reports completed and missing notifications.",
       inputSchema: {
         type: "object",
-        properties: { key: { type: "string", description: "The notification key from notifications.list." } },
-        required: ["key"],
+        properties: {
+          key: { type: "string", minLength: 1, description: "One notification key from notifications.list; omit when using keys." },
+          keys: { type: "array", items: { type: "string", minLength: 1 }, minItems: 1, maxItems: notificationLimit, uniqueItems: true,
+            description: "All explicitly requested notification keys from notifications.list, in one batch; omit key." },
+        },
+        // Codex closes required-only oneOf branches; enforce key/keys exclusivity in the handler.
         additionalProperties: false,
       },
     },
     (args) => {
-      const key = String(args?.key ?? "").trim();
-      if (!key) return err("notifications.dismiss requires a key");
-      return dismissNotification(key) ? ok("Dismissed.") : err("No notification with that key.");
+      if (!args || typeof args !== "object" || Array.isArray(args) ||
+          Object.keys(args).some(name => name !== "key" && name !== "keys")) {
+        return err("notifications.dismiss requires either key or keys");
+      }
+      const batch = Object.prototype.hasOwnProperty.call(args, "keys");
+      if (batch === Object.prototype.hasOwnProperty.call(args, "key")) {
+        return err("notifications.dismiss requires exactly one of key or keys");
+      }
+      const rawKeys = batch ? args.keys : [args.key];
+      if (!Array.isArray(rawKeys) || rawKeys.length < 1 || rawKeys.length > notificationLimit ||
+          rawKeys.some(key => typeof key !== "string" || !key.trim())) {
+        return err(`notifications.dismiss requires 1 to ${notificationLimit} non-empty string keys`);
+      }
+      const keys: string[] = rawKeys.map(key => key.trim());
+      if (new Set(keys).size !== keys.length) return err("notifications.dismiss requires unique keys");
+      if (global.isIOS && !isNotificationRelayReady()) return err(notificationRelayMessage());
+      if (batch) {
+        const notFound = keys.filter(key => !dismissNotification(key));
+        return ok(JSON.stringify({ action: global.isIOS ? "hidden_from_faceclaw" : "dismissed",
+          requested: keys.length, completed: keys.length - notFound.length, notFound,
+          remaining: readActiveNotifications(ALL_NOTIFICATIONS).length }));
+      }
+      const key = keys[0];
+      if (!dismissNotification(key)) return err(global.isIOS
+        ? "No notification with that key in Faceclaw."
+        : "No notification with that key.");
+      return ok(global.isIOS ? "Hidden from Faceclaw on the glasses." : "Dismissed.");
     },
   );
 }

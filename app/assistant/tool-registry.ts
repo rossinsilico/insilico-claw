@@ -46,7 +46,19 @@ export type ToolResult = {
   error?: string;
 };
 
-export type ToolHandler = (args: any) => Promise<ToolResult> | ToolResult;
+export type ToolCallSignal = {
+  readonly aborted: boolean;
+  addEventListener(type: "abort", listener: () => void, options?: { once?: boolean }): void;
+  removeEventListener(type: "abort", listener: () => void): void;
+};
+
+export type ToolCallContext = {
+  /** Trusted model destination selected by the phone, never by tool arguments. */
+  healthDestination?: string;
+  signal?: ToolCallSignal;
+};
+
+export type ToolHandler = (args: any, context?: ToolCallContext) => Promise<ToolResult> | ToolResult;
 
 export type ToolRegistration = {
   spec: ToolSpec;
@@ -66,6 +78,10 @@ export type ListToolsOptions = {
 export type CallToolOptions = {
   /** The call is happening outside an active voice turn; enforce proactive gating. */
   proactive?: boolean;
+  /** Trusted model destination selected by the phone, never by tool arguments. */
+  healthDestination?: string;
+  /** Parent turn cancellation. The registry derives a per-call signal from it. */
+  signal?: ToolCallSignal;
 };
 
 const DEFAULT_TOOL_TIMEOUT_MS = 10_000;
@@ -212,10 +228,19 @@ export class ToolRegistry {
       return { ok: false, error: `Tool ${name} cannot be called outside a conversation` };
     }
     const timeoutMs = registration.spec.timeoutMs ?? DEFAULT_TOOL_TIMEOUT_MS;
+    const signal = new MutableToolCallSignal();
+    const abort = () => signal.abort();
+    if (options.signal?.aborted) signal.abort();
+    else options.signal?.addEventListener("abort", abort, { once: true });
     try {
-      return await this.withTimeout(registration.handler(args), timeoutMs, name);
+      return await this.withTimeout(registration.handler(args, {
+        healthDestination: options.healthDestination,
+        signal,
+      }), timeoutMs, name, abort);
     } catch (error) {
       return { ok: false, error: `Tool ${name} failed: ${describeError(error)}` };
+    } finally {
+      options.signal?.removeEventListener("abort", abort);
     }
   }
 
@@ -244,6 +269,7 @@ export class ToolRegistry {
     result: Promise<ToolResult> | ToolResult,
     timeoutMs: number,
     name: string,
+    onTimeout: () => void,
   ): Promise<ToolResult> {
     if (!(result instanceof Promise)) return Promise.resolve(result);
     return new Promise<ToolResult>((resolve) => {
@@ -251,6 +277,7 @@ export class ToolRegistry {
       const timer = setTimeout(() => {
         if (settled) return;
         settled = true;
+        onTimeout();
         resolve({ ok: false, error: `Tool ${name} timed out after ${timeoutMs}ms` });
       }, timeoutMs);
       result.then(
@@ -268,6 +295,28 @@ export class ToolRegistry {
         },
       );
     });
+  }
+}
+
+class MutableToolCallSignal implements ToolCallSignal {
+  private readonly listeners = new Set<() => void>();
+  aborted = false;
+
+  addEventListener(type: "abort", listener: () => void): void {
+    if (type !== "abort") return;
+    if (this.aborted) listener();
+    else this.listeners.add(listener);
+  }
+
+  removeEventListener(type: "abort", listener: () => void): void {
+    if (type === "abort") this.listeners.delete(listener);
+  }
+
+  abort(): void {
+    if (this.aborted) return;
+    this.aborted = true;
+    for (const listener of this.listeners) listener();
+    this.listeners.clear();
   }
 }
 

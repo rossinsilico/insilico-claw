@@ -17,15 +17,15 @@
  * wiring should call it before its first write.
  */
 
-import { File, knownFolders } from "@nativescript/core";
+import { File } from "@nativescript/core";
 
 import { buildFixtures, FIXTURE_VERSION } from "./health-fixtures";
-import { checkedFileOperation, healthStore } from "./health-store-files";
+import { checkedFileOperation, healthFolder, healthStore } from "./health-store-files";
 
 const MARKER_FILE = "fixture-marker.json";
 
 function markerPath(): string {
-  return `${knownFolders.documents().getFolder("health").path}/${MARKER_FILE}`;
+  return `${healthFolder().path}/${MARKER_FILE}`;
 }
 
 type Marker = { version: number; seededAtMs: number; days: number };
@@ -49,7 +49,7 @@ export function isFixtureData(): boolean {
 const LIVE_FILE = "live-marker.json";
 
 function livePath(): string {
-  return `${knownFolders.documents().getFolder("health").path}/${LIVE_FILE}`;
+  return `${healthFolder().path}/${LIVE_FILE}`;
 }
 
 /** True once this install has ever stored a record decoded off the ring. */
@@ -81,7 +81,7 @@ export function markLiveData(): void {
 export function purgeFixtureData(): void {
   if (!isFixtureData()) return;
   try {
-    const folder = knownFolders.documents().getFolder("health");
+    const folder = healthFolder();
     for (const entity of folder.getEntitiesSync()) {
       const name = entity.name;
       const isStoreFile =

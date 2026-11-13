@@ -18,11 +18,27 @@ const face = {
 
 function harness() {
   const timers = [];
+  let typographyRevision = 0;
+  let typographyListener = null;
+  let typographyUnsubscribed = false;
   const load = loader({ global: { isIOS: true }, setTimeout: fn => { timers.push(fn); return timers.length; }, clearTimeout() {}, Promise }, {
     '@nativescript/core': { ApplicationSettings: { getString: (_k, d) => d, setString() {} } },
     'upng-js': require('upng-js'),
     '../../graphics/evenhub-font': { EvenHubFont: { get: () => face } },
-    './fonts': { containerFace: () => face, availableFontFamilies: () => [], measureContainerText: () => ({ width: 0, lineHeight: 27 }) },
+    './fonts': {
+      containerFace: () => face,
+      availableFontFamilies: () => [],
+      measureContainerText: (text, _font, maxWidth) => ({
+        width: text.length * 10, lineHeight: 27, revision: typographyRevision,
+        ...(maxWidth === undefined ? {} : { lines: text.split('\n') }),
+      }),
+    },
+    '../../graphics/ui-fonts': {
+      onUiFontChanged: (listener) => {
+        typographyListener = listener;
+        return () => { typographyListener = null; typographyUnsubscribed = true; };
+      },
+    },
     '../../ui/dashboard-settings': {}, '../../ui/sound-effects': {}, './api-key-dialog': {},
     './mic-router': { evenHubMicRouter: {} }, './imu-router': { evenHubImuRouter: {} },
     './compass-router': { evenHubCompassRouter: {} }, '../../assistant/tool-registry': {},
@@ -32,7 +48,13 @@ function harness() {
   const api = load('app/apps/evenhub/session.ts');
   const session = new api.EvenHubSession({ name: 'Probe', packageId: 'test.stock', permissions: [] }, '/test/dist', () => {}, '');
   let windowClosed = false;
-  session.attachWindow({ requestRender() {}, windowId: 'probe', closeWindow: () => { windowClosed = true; } });
+  let viewport = { width: 576, height: 288 };
+  const tallRequests = [];
+  session.attachWindow({
+    requestRender() {}, windowId: 'probe', closeWindow: () => { windowClosed = true; },
+    setTallCanvas: tall => tallRequests.push(tall),
+    getViewport: () => viewport,
+  });
   const web = vm.createContext({ Promise, Map, Date, console });
   web.window = web;
   web.__faceclawEvenHub = { postMessage: (name, args, id) => session.handleBridgeCall(name, args, id) };
@@ -45,7 +67,17 @@ function harness() {
   };
   const call = (method, data = {}) => web.flutter_inappwebview.callHandler('evenAppMessage', JSON.stringify({ method, data }));
   const runTimers = () => { for (const fn of timers.splice(0)) fn(); };
-  return { session, call, events, runTimers, windowClosed: () => windowClosed };
+  return {
+    session, call, events, runTimers, windowClosed: () => windowClosed,
+    extensions: () => {
+      vm.runInContext(api.buildFaceclawExtensionsScript('Faceclaw/test'), web);
+      return web.getFaceclawExtensions();
+    },
+    setViewport: value => { viewport = value; session.viewportChanged(); },
+    changeTypography: revision => { typographyRevision = revision; typographyListener?.(revision); },
+    typographyUnsubscribed: () => typographyUnsubscribed,
+    tallRequests,
+  };
 }
 
 const lines = n => Array.from({ length: n }, (_, i) => `line ${i}`).join('\n');
@@ -77,6 +109,41 @@ test('text that fits reports every swipe as reaching an end', async () => {
   h.events.length = 0;
   swipe(h, 'down'); swipe(h, 'down');
   assert.equal(h.events.filter(e => e.type === 'textEvent' && e.jsonData.eventType === 2).length, 2);
+});
+
+test('current-height extension layouts report actual resizes without forcing max', async () => {
+  const h = harness();
+  const fc = h.extensions();
+  const seen = [];
+  fc.addViewportListener(value => seen.push(value));
+  assert.deepEqual(JSON.parse(JSON.stringify(await fc.getViewport())), { width: 576, height: 288 });
+  await fc.createLayout(textPage('responsive'), { heightMode: 'current' });
+  assert.deepEqual(h.tallRequests, []);
+  h.setViewport({ width: 576, height: 360 });
+  h.setViewport({ width: 576, height: 452 });
+  assert.deepEqual(JSON.parse(JSON.stringify(seen)), [{ width: 576, height: 360 }, { width: 576, height: 452 }]);
+});
+
+test('legacy extension layouts still request the max-height canvas', async () => {
+  const h = harness();
+  await h.extensions().createLayout(textPage('legacy'));
+  assert.deepEqual(h.tallRequests, [true]);
+});
+
+test('typography changes arrive after invalidation, whole blocks wrap, and closing unsubscribes', async () => {
+  const h = harness();
+  const fc = h.extensions();
+  const seen = [];
+  fc.addTypographyListener((event) => seen.push(event));
+  assert.deepEqual(JSON.parse(JSON.stringify(await fc.measureText('one\ntwo', undefined, { maxWidth: 120 }))), {
+    width: 70, lineHeight: 27, revision: 0, lines: ['one', 'two'],
+  });
+  h.changeTypography(1);
+  assert.deepEqual(JSON.parse(JSON.stringify(seen)), [{ revision: 1, lineHeight: 27 }]);
+  h.session.close();
+  assert.equal(h.typographyUnsubscribed(), true);
+  h.changeTypography(2);
+  assert.equal(seen.length, 1);
 });
 
 test('text upgrades replace the whole text by id, ignore offsets, and keep old text when emptied', async () => {

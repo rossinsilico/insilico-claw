@@ -51,6 +51,18 @@ test('version and api level are available synchronously', () => {
   assert.equal(fc.apiVersion, 1);
 });
 
+test('viewport calls and resize events are available without changing the published API surface', async () => {
+  const { win, fc, posted } = page();
+  const seen = [];
+  fc.addViewportListener((viewport) => seen.push(viewport));
+  const viewport = fc.getViewport();
+  assert.deepEqual(posted.map((p) => p.args), [['getViewport']]);
+  win.__fcExtEvent('viewport', { width: 576, height: 360 });
+  win.__fcExtResolve(posted[0].id, true, { width: 576, height: 288 });
+  assert.deepEqual(seen, [{ width: 576, height: 360 }]);
+  assert.deepEqual(await viewport, { width: 576, height: 288 });
+});
+
 test('calls resolve with the host value and reject with an Error', async () => {
   const { win, fc, posted } = page();
   const ok = fc.getConfiguredApiKeys();
@@ -160,15 +172,23 @@ test('window controls are fire-and-forget; startVoiceInput resolves the host ans
   assert.equal(await voice, false);
 });
 
-test('font queries are calls; measureText sends null for no font', () => {
-  const { fc, posted } = page();
+test('font queries and typography listeners preserve legacy calls and add whole-block options', () => {
+  const { win, fc, posted } = page();
+  const seen = [];
+  const off = fc.addTypographyListener((event) => seen.push(event));
   void fc.getFonts();
   void fc.measureText('hi');
   void fc.measureText(42, { family: 'Inter', size: 30 });
+  void fc.measureText('a block', undefined, { maxWidth: 200 });
   assert.deepEqual(posted.map((p) => p.args), [
     ['getFonts'],
     ['measureText', 'hi', null],
     ['measureText', '42', { family: 'Inter', size: 30 }],
+    ['measureText', 'a block', null, { maxWidth: 200 }],
   ]);
   assert.ok(posted.every((p) => p.id > 0));
+  win.__fcExtEvent('typography', { revision: 3, lineHeight: 19 });
+  off();
+  win.__fcExtEvent('typography', { revision: 4, lineHeight: 22 });
+  assert.deepEqual(seen, [{ revision: 3, lineHeight: 19 }]);
 });

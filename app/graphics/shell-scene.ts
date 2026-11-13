@@ -30,14 +30,19 @@ export function encodeShellScene(planes: readonly Plane[], screenDepth = 0): Uin
       if (image.pixels[y * image.width + x] === 0) continue
       left = Math.min(left, x); right = Math.max(right, x); top = Math.min(top, y); bottom = Math.max(bottom, y)
     }
-    if (right < left) continue
-    const w = right - left + 1, h = bottom - top + 1
-    if (5 + Math.ceil(w / 2) * h > 65536) throw new Error(`Shell surface ${plane.shellKey} exceeds 64 KiB (${w}×${h})`)
-    const cropped = shellCrop(image, left, top, w, h, plane.shellKey!)
     const selections = plane.image.draws
       .filter((d): d is PlacedImage => d.kind === "image" && !!d.presentation)
       .map(d => encodePresentation({ ...d, x: d.x + plane.x, y: d.y + plane.y,
         presentation: { ...d.presentation!, depth: d.presentation!.depth + (plane.depth ?? 0) } }))
+    if (right < left) {
+      // Retained-only overlays still need a shell owner. Its opaque carrier
+      // lives outside both lenses, so expiration reveals the lower layers.
+      if (selections.length) layers.push({ depth: 0, selections, image: new GrayImage(1, 1), x: 1024, y: 1024, key: plane.shellKey!, dim: Math.round((plane.dimUnderneath ?? 1) * 256) })
+      continue
+    }
+    const w = right - left + 1, h = bottom - top + 1
+    if (5 + Math.ceil(w / 2) * h > 65536) throw new Error(`Shell surface ${plane.shellKey} exceeds 64 KiB (${w}×${h})`)
+    const cropped = shellCrop(image, left, top, w, h, plane.shellKey!)
     layers.push({ depth: plane.depth ?? 0, selections, image: cropped.image, x: plane.x + left, y: plane.y + top, key: plane.shellKey!, dim: Math.round((plane.dimUnderneath ?? 1) * 256) })
   }
   const result = new Uint8Array(4 + layers.reduce((n, l) => n + 16 + l.image.pixels.length + l.selections.reduce((sum, b) => sum + b.length, 0), 0))

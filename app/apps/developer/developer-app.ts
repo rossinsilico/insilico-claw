@@ -69,8 +69,6 @@ function debugTestsMenu(openInputEvents: OpenPage, openMicrophones: OpenPage): M
       },
       {
         label: "Ring status",
-        disabled: global.isIOS,
-        description: global.isIOS ? "Not available on iOS yet." : undefined,
         onSelect: (ctx) => {
           ctx.stack.push(new RingStatusLayer(DEVELOPER_WINDOW_ID, ctx.actions.requestRender));
         },

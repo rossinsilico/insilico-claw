@@ -442,11 +442,13 @@ function chromeLayer(g, { notifications = 0, phoneBattery = null, windows = 1, t
     '../../graphics/textwrap': require('../.test-build/app/graphics/textwrap.js'),
     '../../graphics/battery': require('../.test-build/app/graphics/battery.js'),
     './ambient-cards': { activeAmbientCards: () => [] },
+    '../../native/notification-sources': { readNotificationSources: () => [] },
     '../../native/notification-icons': { ALL_NOTIFICATIONS: 0x7fffffff, readActiveNotificationIcons: (max) => {
       requested.push(max);
       const count = Math.min(max, notifications);
       return { icons: Array.from({ length: count }, () => new graphics.GrayImage(ICON, ICON, 200)),
-        keys: Array.from({ length: count }, (_, index) => `n${index}`), stale: false };
+        keys: Array.from({ length: count }, (_, index) => `n${index}`),
+        packageNames: Array.from({ length: count }, (_, index) => `com.test.${index}`), stale: false };
     } },
     '../../native/notification-types': notificationTypes,
     '../../native/phone-battery': { readPhoneBatteryState: () => ({ battery: phoneBattery, charging: false }) },

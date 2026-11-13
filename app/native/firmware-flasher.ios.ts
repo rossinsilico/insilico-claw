@@ -6,7 +6,7 @@ import { kotlinListener } from './kotlin-listener.ios'
 import type { FlashState, FlashProgress } from '../g2/firmware-types'
 export type { FlashState, FlashProgress } from '../g2/firmware-types'
 
-declare const FaceclawKitIosFirmwareFlasher: any, FaceclawKitFaceclawFirmwareFlasherListener: any
+declare const NSBundle: any, FaceclawKitIosFirmwareFlasher: any, FaceclawKitFaceclawFirmwareFlasherListener: any
 
 /**
  * iOS twin of the Android FirmwareFlasher wrapper. The OTA transfer itself is the shared
@@ -63,9 +63,10 @@ export class FirmwareFlasher {
 
   private async run(): Promise<void> {
     this.previousIdle = UIApplication.sharedApplication.idleTimerDisabled
-    UIApplication.sharedApplication.idleTimerDisabled = true
-    Application.on(Application.suspendEvent, this.backgrounded)
     try {
+      if (NSBundle.mainBundle.bundleIdentifier === 'com.rosspingatore.faceclawpilot') throw new Error('The FaceClaw Pilot cannot change glasses firmware. Use the separate recovery app for firmware updates.')
+      UIApplication.sharedApplication.idleTimerDisabled = true
+      Application.on(Application.suspendEvent, this.backgrounded)
       if (UIApplication.sharedApplication.applicationState !== UIApplicationState.Active) throw new Error('Keep Faceclaw open on the iPhone while flashing.')
       this.emit(this.stateListeners, 'validating', '')
       const image = readFirmwareFile(this.path)

@@ -16,6 +16,7 @@ import { isIgnoringBatteryOptimizations, requestIgnoreBatteryOptimizations } fro
 import { hasAllFilesAccess, requestAllFilesAccess } from "../native/file-access";
 import { isNotificationListenerEnabled, requestNotificationListenerAccess } from "../native/notification-access";
 import { mediaControllerBridge } from "../native/media-controller";
+import { requestAppleHealthAccess } from "../native/apple-health";
 import { finishOnboardingNavigation } from "./onboarding-navigation";
 import { isPreviewOnlyMode, setOnboardingCompleted } from "./onboarding-state";
 
@@ -121,6 +122,18 @@ const PERMISSIONS: PermissionDefinition[] = global.isIOS ? [{
   optional: true,
   isGranted: () => mediaControllerBridge.hasAccess(),
   request: () => mediaControllerBridge.requestAccess(),
+}, {
+  id: "apple-health", title: "Apple Health",
+  description: "Optional: save ring measurements and read health summaries. Review access separately for each health category.",
+  optional: true,
+  // HealthKit does not disclose an app's read-authorization choices.
+  isGranted: () => false,
+  request: async () => {
+    await requestAppleHealthAccess();
+    await Dialogs.alert({ title: "Apple Health access",
+      message: "To change existing choices, open the Health app, tap your profile, then Apps and select FaceClaw Pilot. Read and write access is controlled separately for each category.",
+      okButtonText: "OK" });
+  },
 }] : ANDROID_PERMISSIONS;
 
 /** One Repeater card: the permission's copy plus the display-only fields the XML binds. */
@@ -187,7 +200,7 @@ export class PermissionsViewModel extends Observable {
   }
 
   get instructions(): string {
-    if (global.isIOS) return "Faceclaw uses Bluetooth to communicate with your smart glasses. Calendar and Apple Music access are optional. Tap a card to allow access; a checkmark means access is allowed.";
+    if (global.isIOS) return "Bluetooth connects your glasses. Calendar, Apple Music and Apple Health are optional. Tap a card to review access. Health permissions are managed per category; checkmarks apply to the other permissions.";
     return this.onboarding
       ? `Faceclaw uses these ${global.isIOS ? "iOS" : "Android"} permissions. Tap a card to grant one; a checkmark means it is already granted. ` +
           "Optional permissions can also be granted later, from the Permissions item in the main-screen menu."

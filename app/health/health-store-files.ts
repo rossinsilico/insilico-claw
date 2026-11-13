@@ -1,6 +1,6 @@
 /**
  * The real, on-device backing for `HealthStore`: files under the app's
- * documents folder, using the same `@nativescript/core` File API that
+ * private Application Support folder on iOS (Documents on Android), using the same File API that
  * `open-apps-persistence.ts` already uses for the open-window list.
  *
  * Split out from `health-store.ts` purely so that module can stay free of
@@ -14,8 +14,10 @@ import { HealthStore, type HealthStorageBackend } from "./health-store";
 
 const FOLDER_NAME = "health";
 
-function healthFolder(): Folder {
-  return knownFolders.documents().getFolder(FOLDER_NAME);
+export function healthFolder(): Folder {
+  return typeof global !== "undefined" && global.isIOS
+    ? knownFolders.ios.library().getFolder(`Application Support/${FOLDER_NAME}`)
+    : knownFolders.documents().getFolder(FOLDER_NAME);
 }
 
 function pathFor(name: string): string {

@@ -1,5 +1,5 @@
 import { toData, fromData } from './kotlin-data'
-import { rgbaFromPacket } from './image-rgba'
+import { rgbaFromPacket } from './image-rgba-packet'
 declare const FaceclawGraphics: any
 
 /** Decoded RGBA of encoded image bytes, or null when undecodable (transparent pixels come out black). */

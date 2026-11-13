@@ -73,10 +73,11 @@ class HealthLayer implements Layer {
     // Ask for something current rather than showing whatever the last
     // automatic 30-minute pull happened to catch. Returns immediately; the
     // pull takes ~15s and lands via the refresh tick below.
-    requestFreshPull();
+    // iOS Direct sync temporarily borrows the gesture link; restoring this window must not start one.
+    if (!global.isIOS) requestFreshPull();
     seedFixturesIfNeeded();
     this.reload();
-    this.timer = setInterval(() => this.reload(), REFRESH_INTERVAL_MS);
+    this.timer = setInterval(() => this.reload(), global.isIOS ? 5_000 : REFRESH_INTERVAL_MS);
   }
 
   stop(): void {
@@ -182,6 +183,11 @@ export function createHealthAppWindow(options: InProcessAppOptions): InProcessWi
     icon: "activity",
     closeable: true,
     actions: options.actions,
+    menuItems: () => global.isIOS ? [{
+      label: "Sync ring now",
+      description: "Reads saved measurements. Ring controls pause briefly; glasses controls still work.",
+      onSelect: (ctx) => { ctx.stack.pop(); requestFreshPull(); },
+    }] : [],
     baseLayer: new YieldAtRootLayer(layer),
     submitFrame: options.submitFrame,
     setSurfaceVisible: options.setSurfaceVisible,

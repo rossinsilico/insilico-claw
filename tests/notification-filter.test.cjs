@@ -58,22 +58,47 @@ test('"Display new notifications" defaults to 15s; Off stops every popup, the fi
   assert.equal(api.shouldPopUpNewNotification('com.other'), true);
 });
 
-test('sources default on and retain per-package choices and names across restart and rediscovery', () => {
+test('sources default both controls on and retain independent choices and names across restart and rediscovery', () => {
   const settings = new Map();
   let prefs = store(settings);
   assert.equal(prefs.shouldShowNotificationOnGlasses(mail.packageName), true);
+  assert.equal(prefs.shouldShowNotificationStatusIcon(mail.packageName), true);
   prefs.rememberNotificationSources([mail, mail, { packageName: 'com.other', appName: 'Mail' }]);
   assert.equal(prefs.readNotificationSources().length, 2);
   prefs.setNotificationSourceEnabled({ ...mail, text: 'private notification content' }, false);
+  assert.equal(prefs.shouldShowNotificationStatusIcon(mail.packageName), true);
+  prefs.setNotificationSourceStatusIconEnabled({ ...mail, text: 'other private content' }, false);
+  assert.equal(prefs.shouldShowNotificationOnGlasses(mail.packageName), false);
   assert.ok(!Array.from(settings.values()).join('').includes('private notification content'));
+  assert.ok(!Array.from(settings.values()).join('').includes('other private content'));
   prefs = store(settings);
   prefs.rememberNotificationSources([{ ...mail, appName: 'Renamed Mail' }, { packageName: 'com.new', appName: '' }]);
   assert.equal(prefs.shouldShowNotificationOnGlasses(mail.packageName), false);
+  assert.equal(prefs.shouldShowNotificationStatusIcon(mail.packageName), false);
   assert.equal(prefs.shouldShowNotificationOnGlasses('com.other'), true);
+  assert.equal(prefs.shouldShowNotificationStatusIcon('com.other'), true);
   assert.equal(prefs.shouldShowNotificationOnGlasses('com.new'), true);
+  assert.equal(prefs.shouldShowNotificationStatusIcon('com.new'), true);
   assert.equal(prefs.readNotificationSources().find((s) => s.packageName === mail.packageName).appName, 'Renamed Mail');
   prefs.setNotificationSourceEnabled(mail, true);
   assert.equal(store(settings).shouldShowNotificationOnGlasses(mail.packageName), true);
+  assert.equal(store(settings).shouldShowNotificationStatusIcon(mail.packageName), false);
+});
+
+test('legacy muted sources keep their icon, and all popup/icon combinations persist independently', () => {
+  const settings = new Map([['notifications.sources', JSON.stringify([{ ...mail, showOnGlasses: false }])]]);
+  let prefs = store(settings);
+  assert.equal(prefs.shouldShowNotificationOnGlasses(mail.packageName), false);
+  assert.equal(prefs.shouldShowNotificationStatusIcon(mail.packageName), true);
+  for (const [popup, icon] of [[false, false], [false, true], [true, false], [true, true]]) {
+    prefs.setNotificationSourceEnabled(mail, popup);
+    prefs.setNotificationSourceStatusIconEnabled(mail, icon);
+    prefs = store(settings);
+    assert.deepEqual([
+      prefs.shouldShowNotificationOnGlasses(mail.packageName),
+      prefs.shouldShowNotificationStatusIcon(mail.packageName),
+    ], [popup, icon]);
+  }
 });
 
 test('invalid saved source data falls back to enabled', () => {
@@ -87,6 +112,7 @@ function ui(fontSize = 12) {
   let active = [{ ...mail, key: 'key', title: 'Message', text: 'Hello', bigText: '', lines: [], actions: [], postTime: 0 }];
   let dismissals = 0;
   let closes = 0;
+  const pushed = [];
   const textwrap = load('app/graphics/textwrap.ts');
   const graphics = require('../.test-build/app/graphics/image.js');
   const { BdfFont } = load('app/graphics/bdffont.ts', () => ({}));
@@ -133,7 +159,8 @@ function ui(fontSize = 12) {
   dependencies['./menu'] = load('app/ui/menu.ts', requireModule);
   const { SingleNotificationLayer } = load('app/ui/notifications.ts', requireModule);
   const { NotificationFilterLayer } = load('app/ui/notification-filter.ts', requireModule);
-  const ctx = { stack: { getBaseSize: () => ({ width: 540, height: 224 }), isFocused: () => true, pop: () => closes++ } };
+  const ctx = { stack: { getBaseSize: () => ({ width: 540, height: 224 }), isFocused: () => true,
+    pop: () => closes++, push: (layer) => pushed.push(layer) } };
   const popup = new SingleNotificationLayer('key', { origin: 'new-notification-modal', onClose: () => closes++ });
   const trayCloses = [];
   const tray = new SingleNotificationLayer('key', { origin: 'notification-tray', onClose: (_ctx, gone) => trayCloses.push(gone) });
@@ -142,7 +169,8 @@ function ui(fontSize = 12) {
   const paint = (layer) => layer.paint(ctx, () => { paintedBelow++; return new RecordingImage(540, 224); });
   const input = (layer, type) => layer.handleInput({ type }, ctx);
   return { prefs, popup, tray, filter, paint, input, active: (value) => { active = value; },
-    dismissals: () => dismissals, closes: () => closes, trayCloses, paintedBelow: () => paintedBelow };
+    dismissals: () => dismissals, closes: () => closes, trayCloses, paintedBelow: () => paintedBelow,
+    pushed: () => pushed.at(-1) };
 }
 
 test('a notification the switcher selected reports back and dismissal to it, and repeats its last frame once gone', async () => {
@@ -197,17 +225,30 @@ test('cancel and back dismiss the popup without changing source preferences', as
   }
 });
 
-test('filter toggles persist after notifications disappear and discovers new sources while open', async () => {
+test('filter opens per-package popup and status-icon controls and preserves source selection as inventory changes', async () => {
   const app = ui();
   app.paint(app.filter);
   await app.input(app.filter, 'click');
+  const mailSettings = app.pushed();
+  const labels = app.paint(mailSettings).texts.map(({ text }) => text);
+  assert.ok(labels.includes('Popups'));
+  assert.ok(labels.includes('Status-bar icon'));
+  await app.input(mailSettings, 'click');
   assert.equal(app.prefs.shouldShowNotificationOnGlasses(mail.packageName), false);
+  assert.equal(app.prefs.shouldShowNotificationStatusIcon(mail.packageName), true);
+  await app.input(mailSettings, 'scroll-down');
+  await app.input(mailSettings, 'click');
+  assert.equal(app.prefs.shouldShowNotificationOnGlasses(mail.packageName), false);
+  assert.equal(app.prefs.shouldShowNotificationStatusIcon(mail.packageName), false);
   app.active([{ packageName: 'com.alpha', appName: 'Alpha' }]);
   const image = app.paint(app.filter);
   assert.ok(image.texts.some(({ text }) => text === 'Alpha'));
   assert.ok(image.texts.some(({ text }) => text === 'Mail'));
-  // A source inserted before the selection must not move the toggle to another app.
+  // A source inserted before the selection must not move selection to another app.
   await app.input(app.filter, 'click');
+  const selectedSettings = app.pushed();
+  assert.notEqual(selectedSettings, mailSettings);
+  await app.input(selectedSettings, 'click');
   assert.equal(app.prefs.shouldShowNotificationOnGlasses(mail.packageName), true);
   assert.equal(app.prefs.shouldShowNotificationOnGlasses('com.alpha'), true);
 });

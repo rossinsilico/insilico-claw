@@ -248,6 +248,11 @@ const loadWindow = (needsWarning) => {
   const pushed = [];
   const closed = [];
   const marked = [];
+  const heightModes = [];
+  let viewport = { width: 576, height: 288 };
+  let relayouts = 0;
+  let viewportChanges = 0;
+  let hooks;
   class FakeWarning { constructor(appName, onAnswered, closeApp) { Object.assign(this, { appName, onAnswered, closeApp }); } }
   const load = loader({}, {
     '../../graphics/image': { GrayImage: class {} },
@@ -256,10 +261,10 @@ const loadWindow = (needsWarning) => {
     '../../ui/layers': {},
     '../../ui/shell/in-process-window': {
       createInProcessWindow: () => ({
-        stack: { push: (layer) => pushed.push(layer) },
-        window: { handleInput: async () => {} },
+        stack: { push: (layer) => pushed.push(layer), getBaseSize: () => viewport },
+        window: { handleInput: async () => {}, relayout: () => { relayouts++; } },
         requestRender() {},
-        setHeightMode() {},
+        setHeightMode: (mode) => heightModes.push(mode),
       }),
     },
     '../../ui/shell/shell': { shell: { closeWindow: (id) => closed.push(id), foregroundWindow: () => null } },
@@ -275,11 +280,12 @@ const loadWindow = (needsWarning) => {
   const { createEvenHubWindow } = load('app/apps/evenhub/evenhub-window.ts');
   const session = {
     manifest: { packageId: 'com.example.demo', name: 'Demo' },
-    attachWindow() {},
+    attachWindow(value) { hooks = value; },
+    viewportChanged() { viewportChanges++; },
   };
   const options = { actions: {}, submitFrame() {}, setSurfaceVisible() {}, removeSurface() {}, onClosed() {} };
-  createEvenHubWindow('evenhub:app:7', 'evenhub', session, options, () => {}, () => {});
-  return { pushed, closed, marked, FakeWarning };
+  const created = createEvenHubWindow('evenhub:app:7', 'evenhub', session, options, () => {}, () => {});
+  return { pushed, closed, marked, FakeWarning, created, hooks, heightModes, setViewport: (value) => { viewport = value; }, relayouts: () => relayouts, viewportChanges: () => viewportChanges };
 };
 
 test('an EvenHub window opens under the warning when the app needs one', () => {
@@ -296,4 +302,21 @@ test('an EvenHub window opens under the warning when the app needs one', () => {
 
 test('an EvenHub window opens straight to the app otherwise', () => {
   assert.equal(loadWindow(false).pushed.length, 0);
+});
+
+test('EvenHub windows report the actual viewport after display relayouts', () => {
+  const h = loadWindow(false);
+  assert.deepEqual(JSON.parse(JSON.stringify(h.hooks.getViewport())), { width: 576, height: 288 });
+  h.setViewport({ width: 576, height: 360 });
+  h.created.window.relayout();
+  h.setViewport({ width: 576, height: 452 });
+  h.created.window.relayout();
+  assert.equal(h.relayouts(), 2);
+  assert.equal(h.viewportChanges(), 2);
+  assert.deepEqual(JSON.parse(JSON.stringify(h.hooks.getViewport())), { width: 576, height: 452 });
+  h.setViewport({ width: 640, height: 452 });
+  assert.deepEqual(JSON.parse(JSON.stringify(h.hooks.getViewport())), { width: 576, height: 452 }, 'the app sees its centred logical canvas, not physical side slack');
+  h.hooks.setTallCanvas(true);
+  assert.deepEqual(h.heightModes, ['max']);
+  assert.equal(h.viewportChanges(), 3);
 });

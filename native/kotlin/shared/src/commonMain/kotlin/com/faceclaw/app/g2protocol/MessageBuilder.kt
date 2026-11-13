@@ -262,6 +262,36 @@ class MessageBuilder {
         )
     }
 
+    fun headUpAngleWrite(angle: Int, leftArm: Boolean): OutboundMessage {
+        val magic = magicPool.allocate()
+        return OutboundMessage(
+            "head-up-angle-write",
+            "head-up angle=$angle " + (if (leftArm) "L" else "R"),
+            BleProtocol.SID_UI_SETTING,
+            BleProtocol.FLAG_REQUEST,
+            magic,
+            BleProtocol.buildSetHeadUpAngle(magic, angle),
+            ACK_TIMEOUT_MS,
+            -1,
+            leftArm,
+        )
+    }
+
+    fun headUpAngleQuery(leftArm: Boolean): OutboundMessage {
+        val magic = magicPool.allocate()
+        return OutboundMessage(
+            "head-up-angle-query",
+            "head-up angle query " + (if (leftArm) "L" else "R"),
+            BleProtocol.SID_UI_SETTING,
+            BleProtocol.FLAG_REQUEST,
+            magic,
+            BleProtocol.buildSettingsQuery(magic),
+            ACK_TIMEOUT_MS,
+            -1,
+            leftArm,
+        )
+    }
+
     fun caseInfoQuery(): OutboundMessage {
         val magic: Int = magicPool.allocate()
         return OutboundMessage(

@@ -372,6 +372,40 @@ class DisplayListTest {
             assertContentEquals(BmpUtil.pack4bppFromGray8(fits.preview(gray, 640, 480, glasses.right), 640, 480), glasses.composition)
         }
     }
+    @Test fun timedNotificationStaysRetainedWhenLowerLayersExceedTheResourceBudget() {
+        // Actual TS display-list envelope: one 548x239 popup, TIME-based copy
+        // moves 1024 pixels offscreen at 5000ms. No subsequent host frame.
+        val bytes = hex("07e7ff01004e000e002402ef0000010000000000000001002402ef00") +
+            ByteArray(548 * 239) { 240.toByte() } +
+            hex("0100020000000000002402ef00ff2401938880019388161101001732800193881610019387110100173001013023310184001200")
+        val reader = ArrayByteReader(bytes)
+        assertEquals(7, reader.get().toInt())
+        val timed = FrameDisplayList.read(reader, drawAnimationTimeMs() + 1_000_000)
+        val cache = ResourceCacheState()
+        cache.prepare(List(3) { index -> CachedResource(ByteArray(60_000) { (index + 1).toByte() }) })
+        cache.drainCommands(3600)
+        val planner = ScenePlanner(cache)
+        val lower = (1..3).map { key -> ShellScene.Layer(key, 14, key * 10, 612, 214, 256, ByteArray(306 * 214) { 0x33 }) }
+        val popup = ShellScene.Layer(4, 1024, 1024, 1, 1, 256, byteArrayOf(0), listOf(timed))
+        val scene = ShellScene(lower + popup, screenDepth = -16)
+        val app = ByteArray(640 * 480 / 2) { (it * 37).toByte() }
+        val plan = planner.plan(app, 640, 480, null, scene, 1)
+        assertTrue(plan.bakedLayers in 1..3, "Only lower layers may flatten: ${plan.bakedLayers}")
+        assertTrue(cache.resourceId(timed.resources.single()) >= 0)
+        assertTrue(cache.usedBytes() <= ResourceCacheState.CACHE_SIZE)
+        for (right in listOf(false, true)) {
+            val glasses = Glasses(right)
+            glasses.apply(plan.commands)
+            for (elapsed in listOf(0L, 4999L, 5000L, 6000L)) {
+                val output = ByteArray(app.size)
+                DisplayListRenderer(glasses.resources, rightLens = right).render(glasses.root,
+                    DisplayListRenderer.Target(glasses.screen, 640, 480), DisplayListRenderer.Target(output, 640, 480), elapsed)
+                val target = DisplayListRenderer.Target(output, 640, 480)
+                assertEquals(if (elapsed < 5000) 15 else 3, target.get(100, 100), "$right/$elapsed")
+            }
+        }
+    }
+
     @Test fun noisyFramesRemainBoundedAndResourceBudgetIs192KiB() {
         val cache=ResourceCacheState();val planner=ScenePlanner(cache);val glasses=Glasses()
         val app=ByteArray(640*480/2){(it*37).toByte()}

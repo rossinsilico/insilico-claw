@@ -50,7 +50,7 @@ function fixture({ glasses = 'g2', ios = false, completed = false, ring = false,
   // Permission checks: everything granted.
   const granted = new Proxy({}, { get: () => () => true });
   for (const name of ['../native/ios-bluetooth', '../g2/android-permissions', '../native/calendar-permissions', '../native/battery-optimization',
-    '../native/file-access', '../native/notification-access']) modules[name] = granted;
+    '../native/file-access', '../native/notification-access', '../native/apple-health']) modules[name] = granted;
   modules['../native/media-controller'] = { mediaControllerBridge: { hasAccess: () => true } };
   const loadPage = file => load(`app/phone-ui/${file}.ts`, modules, globals);
   return { state, loadPage };

@@ -33,7 +33,10 @@ const {
   rangeAverageText,
 } = require("../.test-build/app/health/health-chart.js");
 const { GLANCE_PAGES } = require("../.test-build/app/health/health-glance.js");
-const { startOfLocalDay, DAY_MS, SAMPLE_METRICS } = require("../.test-build/app/health/health-types.js");
+const {
+  startOfLocalDay, DAY_MS, SAMPLE_METRICS,
+  METRIC_LABELS, METRIC_UNITS, SAMPLE_METRIC_LABELS, SAMPLE_METRIC_UNITS,
+} = require("../.test-build/app/health/health-types.js");
 
 test("the two sleep stage orders are stated in opposite directions but agree on screen", () => {
   // Week/month/quarter: stacked upward from zero, deep at the bottom.
@@ -177,6 +180,13 @@ test("HRV reached the daily summary", () => {
   assert.ok(summary.hrv.max >= summary.hrv.min);
 });
 
+test("R1 exposes its proven RMSSD statistic without inventing milliseconds", () => {
+  assert.equal(METRIC_LABELS.hrv, "R1 RMSSD");
+  assert.equal(METRIC_UNITS.hrv, "raw");
+  assert.equal(SAMPLE_METRIC_LABELS.hrv, "R1 RMSSD");
+  assert.equal(SAMPLE_METRIC_UNITS.hrv, "raw");
+});
+
 test("the glasses cursor walks the summary, every parameter, then sleep", () => {
   assert.equal(GLANCE_PAGES[0].kind, "overview", "the glance is where it opens");
   assert.equal(GLANCE_PAGES[GLANCE_PAGES.length - 1].kind, "sleep");
@@ -186,4 +196,7 @@ test("the glasses cursor walks the summary, every parameter, then sleep", () => 
     [...SAMPLE_METRICS].sort(),
     "every measured parameter is reachable by scrolling",
   );
+  const active = walked.indexOf("activeCalories");
+  const total = walked.indexOf("calories");
+  assert.ok(active >= 0 && total >= 0 && active !== total, "active and total calories need distinct pages");
 });

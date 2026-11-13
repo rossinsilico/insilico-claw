@@ -17,11 +17,42 @@ export type AssistantContext = {
   headsetBattery: number | null;
 };
 
+export type AssistantQuestionOption = {
+  label: string;
+  value?: string;
+  description?: string;
+};
+
+export type AssistantQuestion = {
+  questionId: string;
+  header?: string;
+  question: string;
+  options: AssistantQuestionOption[];
+  multiSelect?: boolean;
+  allowEmpty?: boolean;
+};
+
+/** The AbortSignal surface used here, kept structural for non-DOM builds. */
+export type AssistantQuestionSignal = {
+  readonly aborted: boolean;
+  addEventListener(type: "abort", listener: () => void, options?: { once?: boolean }): void;
+  removeEventListener(type: "abort", listener: () => void): void;
+};
+
+export type AssistantQuestionPrompt = {
+  id: string;
+  expiresAtMs: number;
+  questions: AssistantQuestion[];
+  signal: AssistantQuestionSignal;
+};
+
 export type AssistantTurnCallbacks = {
   /** Streamed reply text (delta plus the full text so far). */
   onTextDelta: (delta: string, textSoFar: string) => void;
   /** A tool is being invoked; label is display-ready, e.g. "calendar.list_events". */
   onToolActivity: (label: string) => void;
+  /** Ask the wearer for explicit choices; null leaves the operation unanswered. */
+  onQuestion?: (prompt: AssistantQuestionPrompt) => Promise<Record<string, number[]> | null>;
   onTurnDone: (result: { stopReason: string | null }) => void;
   onError: (message: string) => void;
 };

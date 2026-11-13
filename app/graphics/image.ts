@@ -654,11 +654,11 @@ export class GrayImage {
    * Returns this image unchanged when there are none, otherwise a baked copy
    * with an empty draw list.
    */
-  withDrawsBaked(presentations = true): GrayImage {
+  withDrawsBaked(presentations = true, now = Date.now()): GrayImage {
     if (!this.drawList.length) return this;
     const baked = new GrayImage(this.width, this.height, 0);
     baked.pixels.set(this.pixels);
-    this.bakeDrawsInto(baked, 0, 0, presentations);
+    this.bakeDrawsInto(baked, 0, 0, presentations, now);
     return baked;
   }
 
@@ -677,7 +677,7 @@ export class GrayImage {
   }
 
   /** Rasterize this image's deferred draws into target, translated by (dx, dy). */
-  bakeDrawsInto(target: GrayImage, dx: number, dy: number, presentations = true): void {
+  bakeDrawsInto(target: GrayImage, dx: number, dy: number, presentations = true, now = Date.now()): void {
     for (const placed of this.drawList) {
       if (placed.kind === "glyph") {
         rasterizeGlyph(target, placed.font, placed.glyph, placed.x + dx, placed.y + dy, placed.value);
@@ -686,7 +686,7 @@ export class GrayImage {
           if (!presentations) continue;
           if (placed.presentation.displayList) {
             paintDisplayList(target.pixels, target.pixels.slice(), target.width, target.height,
-              { displayList: placed.presentation.displayList, x: placed.x + dx, y: placed.y + dy, width: placed.source.width, height: placed.source.height, depth: placed.presentation.depth });
+              { displayList: placed.presentation.displayList, x: placed.x + dx, y: placed.y + dy, width: placed.source.width, height: placed.source.height, depth: placed.presentation.depth }, false, now);
             continue;
           }
           if (placed.presentation.mode) {

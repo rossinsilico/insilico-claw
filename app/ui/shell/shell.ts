@@ -23,14 +23,17 @@ import { VoiceInputLayer, type VoiceSendTarget } from "./voice-input";
 import { KeyboardInputLayer, type KeyboardInputSession, type KeyboardInputVisibility } from "./keyboard-input";
 import { voiceActivity } from "./voice-activity";
 import { AssistantLayer } from "./assistant";
+import { AssistantQuestionLayer, isSupportedAssistantQuestionPrompt } from "./assistant-question";
 import { AssistantSession, type AssistantBackendConfig } from "../../assistant/session";
 import { resolveAssistantModel, type AssistantModel } from "../../assistant/models";
 import { AssistantConversations, type ReasoningLevel } from "../../assistant/conversations";
+import { healthDestinationForModel } from "../../assistant/health-destination";
 import { getStringSetting, setStringSetting } from "../../native/settings-store";
-import type { AssistantContext } from "../../assistant/types";
+import type { AssistantContext, AssistantQuestionPrompt } from "../../assistant/types";
 import { SingleNotificationLayer } from "../notifications";
 import {
   anthropicApiKeySetting,
+  appSwitcherIncludeStatusBarSetting,
   assistantHermesKeySetting,
   assistantHermesUrlSetting,
   assistantBackendSetting,
@@ -212,6 +215,8 @@ export type ShellConfig = {
   actions: LayerActions;
   getScreenTimeoutMs: () => number | null;
   requestShellRender: () => void;
+  /** Host verified retained time expressions (G2 CFW revision 29+). */
+  supportsTimedNotificationVisuals?: () => boolean;
   /**
    * Asked before the voice dialog opens; resolving false swallows the open.
    * Preview-only mode uses it to turn the tap into a mic-permission prompt
@@ -261,7 +266,7 @@ export type TrayWidget = {
  * A new-notification popup: the shell modal, and the notification view inside
  * it (null for an app notification, which brings its own layer).
  */
-type NotificationPopup = { modal: ShellModalLayer; content: SingleNotificationLayer | null };
+type NotificationPopup = { notificationKey: string; modal: ShellModalLayer; content: SingleNotificationLayer | null; timeout: NotificationPopupTimeout };
 
 /**
  * The app switcher's selection while it is on a status bar item rather than
@@ -273,6 +278,8 @@ type NotificationPopup = { modal: ShellModalLayer; content: SingleNotificationLa
  */
 type StatusSelection = {
   item: StatusItem;
+  /** Scroll selections follow the setting; explicit mirror touches do not. */
+  origin: "scroll" | "touch";
   /** Where the item sat among the selectable ones, for once it has gone. */
   index: number;
   host: ShellWindow;
@@ -449,7 +456,7 @@ const SWITCHER_SWIPES: Record<
  */
 function chromeSettingsKey(): string {
   return `${batteryIndicatorSettingsKey()}|${timeFormatSetting.get()}|${uiDepth()}|${statusBarPositionSetting.get()}`
-    + `|${statusBarVisibilitySetting.get()}|${windowBorderSetting.get()}`;
+    + `|${statusBarVisibilitySetting.get()}|${windowBorderSetting.get()}|${appSwitcherIncludeStatusBarSetting.get()}`;
 }
 
 class Shell {
@@ -483,11 +490,7 @@ class Shell {
   private readonly appNotifications = new Map<string, AppNotification>();
   private readonly notificationModals = new NotificationModalQueue<NotificationPopup>({
     open: (notificationKey) => this.pushNotificationModal(notificationKey),
-    isAvailable: (notificationKey) => {
-      if (this.appNotifications.has(notificationKey)) return true;
-      const notification = readActiveNotifications(ALL_NOTIFICATIONS).find((item) => item.key === notificationKey);
-      return !!notification && shouldPopUpNewNotification(notification.packageName);
-    },
+    isAvailable: (notificationKey) => this.isNotificationPopupAvailable(notificationKey),
     sleep: () => this.sleep(),
   });
   private conversations: AssistantConversations | null = null;
@@ -505,6 +508,11 @@ class Shell {
       );
     }
     return this.conversations;
+  }
+
+  getAssistantHealthDestination(): string | null {
+    const config = this.resolveAssistantConfiguration();
+    return config?.kind === "direct" ? healthDestinationForModel(config.llm) : null;
   }
 
   async prepareChatVoiceCapture(): Promise<boolean> {
@@ -567,6 +575,7 @@ class Shell {
     this.chromeSettingsSubscribed = true;
     this.lastChromeSettingsKey = chromeSettingsKey();
     onAnySettingChanged(() => {
+      this.reconcileStatusNavigationSetting();
       const key = chromeSettingsKey();
       if (key === this.lastChromeSettingsKey) return;
       this.lastChromeSettingsKey = key;
@@ -766,7 +775,7 @@ class Shell {
     const touched = this.chrome.statusItemAt(x, y);
     const index = items.findIndex((item) => sameStatusItem(item, touched));
     if (index < 0) return false;
-    this.selectStatusItem(items[index]!, index);
+    this.selectStatusItem(items[index]!, index, "touch");
     const selected = this.selectedStatus;
     const host = selected && sameStatusItem(selected.item, touched) ? selected.host : null;
     if (!host) return false;
@@ -813,6 +822,7 @@ class Shell {
 
   /** Turn the screen on (if off) and set focus. Returns whether it was off. */
   wake(focus: FocusKind, nowMs = Date.now()): boolean {
+    this.reconcileNotificationPopup();
     this.lastInputAtMs = nowMs;
     const gaining = focus === "window" ? this.foregroundWindow() : undefined;
     const alreadyFocused = this.isFocusTarget(gaining);
@@ -896,7 +906,7 @@ class Shell {
    * (matching the old sleep-popup behavior).
    */
   openNotificationModal(notificationKey: string, wokeScreen: boolean): void {
-    if (!this.screenOn) return;
+    if (!this.screenOn || !this.isNotificationPopupAvailable(notificationKey)) return;
     this.notificationModals.post(notificationKey, wokeScreen);
     this.config.requestShellRender();
   }
@@ -926,6 +936,12 @@ class Shell {
     this.openNotificationModal(notification.key, wokeScreen);
   }
 
+  private isNotificationPopupAvailable(notificationKey: string): boolean {
+    if (this.appNotifications.has(notificationKey)) return true;
+    const notification = readActiveNotifications(ALL_NOTIFICATIONS).find((item) => item.key === notificationKey);
+    return !!notification && !notification.suppressPopup && shouldPopUpNewNotification(notification.packageName);
+  }
+
   private pushNotificationModal(notificationKey: string): NotificationPopup {
     const appNotification = this.appNotifications.get(notificationKey);
     const close = () => this.closeNotificationModal(popup, notificationKey);
@@ -946,7 +962,9 @@ class Shell {
       },
     );
     const popup: NotificationPopup = {
+      notificationKey,
       content,
+      timeout,
       modal: new ShellModalLayer(
         appNotification ? appNotification.createLayer(close) : content!,
         this.config.actions,
@@ -957,6 +975,7 @@ class Shell {
             this.notificationModals.removed(popup, this.screenOn);
           },
           input: () => timeout.restart(),
+          expiration: () => this.config.supportsTimedNotificationVisuals?.() ? timeout.presentation() : null,
         },
       ),
     };
@@ -975,6 +994,18 @@ class Shell {
     this.config.requestShellRender();
   }
 
+  /** A retained popup may already be invisible while JS was suspended. */
+  private reconcileNotificationPopup(): boolean {
+    const popup = this.notificationModals.currentModal();
+    if (!popup) return false;
+    if (!popup.content?.outlivesNotification() && !this.isNotificationPopupAvailable(popup.notificationKey)) {
+      this.closeNotificationModal(popup, popup.notificationKey);
+      return true;
+    }
+    popup.timeout.setCovered(!this.stack.topMatches((layer) => layer === popup.modal));
+    return popup.timeout.reconcile();
+  }
+
   /** Called by a window when the user backs out of its root (double-tap). */
   yieldFocusToSidebar(): void {
     if (this.focus === "sidebar") return;
@@ -991,12 +1022,16 @@ class Shell {
    * under a Full Screen or immersive window).
    */
   paintScene(): Uint8Array {
+    this.reconcileStatusNavigationSetting();
+    this.reconcileNotificationPopup();
     return this.screenOn
       ? encodeShellScene(this.stack.paintUndimmed(), uiDepth(this.foregroundWindow()?.appId))
       : encodeShellScene([]);
   }
 
   paintSurface(): Plane[] {
+    this.reconcileStatusNavigationSetting();
+    this.reconcileNotificationPopup();
     if (!this.screenOn) {
       return singlePlane(new GrayImage(screenWidth(), screenHeight(), 0));
     }
@@ -1017,6 +1052,8 @@ class Shell {
   async receiveInput(event: InputEvent, frameId = 0): Promise<ShellInputOutcome> {
     if (!acceptInput(event)) return { shell: false, window: false };
     try {
+      // Do not send the wake-up gesture to an unseen successor or underlying app.
+      if (this.reconcileNotificationPopup()) return { shell: true, window: false };
       return await this.routeInput(event, frameId);
     } finally {
       // Whatever the input did (opened an overlay, moved focus, slept the
@@ -1307,8 +1344,10 @@ class Shell {
    * either end.
    */
   private moveSelection(delta: number): void {
+    const includeStatus = appSwitcherIncludeStatusBarSetting.get();
+    if (!includeStatus && this.selectedStatus) this.returnFromStatusItem();
     const windows = this.switcherWindows();
-    const items = this.selectableStatusItems();
+    const items = includeStatus ? this.selectableStatusItems() : [];
     const count = windows.length + items.length;
     if (!count) return;
     let current = this.selectedIndex;
@@ -1323,7 +1362,7 @@ class Shell {
     if (next < windows.length) {
       this.selectSwitcherWindow(windows[next]!);
     } else {
-      this.selectStatusItem(items[next - windows.length]!, next - windows.length);
+      this.selectStatusItem(items[next - windows.length]!, next - windows.length, "scroll");
     }
   }
 
@@ -1365,10 +1404,11 @@ class Shell {
    * on before is left as endStatusSelection leaves it, unless it is this
    * one too.
    */
-  private selectStatusItem(item: StatusItem, index: number): void {
+  private selectStatusItem(item: StatusItem, index: number, origin: StatusSelection["origin"]): void {
     const previous = this.selectedStatus;
     if (previous && sameStatusItem(previous.item, item)) {
       previous.index = index;
+      previous.origin = origin;
       return;
     }
     const returnWindowId = previous ? previous.returnWindowId : (this.foregroundWindow()?.windowId ?? null);
@@ -1382,7 +1422,7 @@ class Shell {
       ? { stack: opened.stack, layer: this.notificationDetailLayer(item.key) } : null;
     if (detail) detail.stack.push(detail.layer);
     this.selectedStatus = {
-      item, index, host, detail, returnWindowId,
+      item, index, origin, host, detail, returnWindowId,
       transient: sameHost ? previous.transient : opened.opened,
     };
     if (hostIndex === this.selectedIndex) {
@@ -1413,6 +1453,13 @@ class Shell {
     if (!selected) return;
     this.selectedStatus = null;
     this.releaseStatusWindow(selected, keepWindow);
+  }
+
+  /** Retire a selected status item as soon as switcher scrolling excludes it. */
+  private reconcileStatusNavigationSetting(): void {
+    if (this.selectedStatus?.origin === "scroll" && !appSwitcherIncludeStatusBarSetting.get()) {
+      this.returnFromStatusItem();
+    }
   }
 
   /**
@@ -1471,7 +1518,7 @@ class Shell {
       const windows = this.switcherWindows();
       if (items.length) {
         const index = Math.min(selected.index, items.length - 1);
-        this.selectStatusItem(items[index]!, index);
+        this.selectStatusItem(items[index]!, index, selected.origin);
       } else if (windows.length) {
         this.selectSwitcherWindow(windows[windows.length - 1]!);
       }
@@ -1842,6 +1889,7 @@ class Shell {
         this.emitAssistantActivity({ phase: "streaming", text: textSoFar });
       },
       onToolActivity: (label) => layer?.onToolActivity(label),
+      onQuestion: (prompt) => this.showAssistantQuestion(prompt),
       onTurnDone: () => {
         layer?.onTurnDone();
         this.emitAssistantActivity({ phase: "done", text: replySoFar });
@@ -1850,6 +1898,30 @@ class Shell {
         layer?.onError(message);
         this.emitAssistantActivity({ phase: "error", text: message });
       },
+    });
+  }
+
+  private showAssistantQuestion(prompt: AssistantQuestionPrompt): Promise<Record<string, number[]> | null> {
+    if (!isSupportedAssistantQuestionPrompt(prompt) || prompt.signal.aborted || prompt.expiresAtMs <= Date.now()) {
+      return Promise.resolve(null);
+    }
+    return new Promise((resolve) => {
+      let questionLayer: AssistantQuestionLayer | null = null;
+      let modal: ShellModalLayer | null = null;
+      let settled = false;
+      questionLayer = new AssistantQuestionLayer(prompt, (answer) => {
+        if (settled) return;
+        settled = true;
+        if (modal) this.stack.remove(modal);
+        this.config.requestShellRender();
+        resolve(answer);
+      });
+      if (settled) return;
+      modal = new ShellModalLayer(questionLayer, this.config.actions, {
+        removed: () => questionLayer?.onRemoved(),
+      });
+      this.stack.push(modal);
+      this.config.requestShellRender();
     });
   }
 

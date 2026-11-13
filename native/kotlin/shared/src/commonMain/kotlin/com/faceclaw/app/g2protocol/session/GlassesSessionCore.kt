@@ -43,6 +43,7 @@ class GlassesSessionCore(
 
         internal const val FACECLAW_WAKE_LEASE_RENEW_MS = 45_000L
         internal const val FACECLAW_WAKE_CONTROL_WAIT_MS = 1_500L
+        internal const val HEAD_UP_ANGLE_WAIT_MS = 10_000L
         internal const val CFW_CLEANUP_WAIT_MS = 4_000L
         internal const val COMPASS_REPORT_INTERVAL_MS = 100
         internal const val COMPASS_MIN_CHANGE_DEGREES = 0
@@ -133,6 +134,8 @@ class GlassesSessionCore(
     internal val micStatusListeners = CopyOnWriteList<FaceclawMicStatusListener>(platform)
     internal val audioMonitorListeners = CopyOnWriteList<FaceclawAudioPacketListener>(platform)
     @Volatile internal var running = false
+    internal var interactiveWorkerStarted = false
+    internal var ringWorkerStarted = false
     @Volatile internal var userDisconnectRequested = false
     // Set when a connect attempt failed while an arm's OS bond is gone, or the
     // glasses reported firmware this app can't run: retrying is pointless until
@@ -152,6 +155,10 @@ class GlassesSessionCore(
     internal var leftConnected = false
     internal var ringConnected = false
     internal var ringNotificationsReady = false
+    internal var ringBackgroundConnectPending = false
+    internal var rejectNextRingConnection = false
+    internal var ringConnectAttemptGeneration = 0L
+    internal var ringConnectAttemptActive = false
     // Ring connect/write/health waits must never park the glasses sender; they
     // run on their own worker (see GlassesSessionRing.kt). The link serializes
     // GATT operations per device address. Counted down when that worker exits.
@@ -176,6 +183,7 @@ class GlassesSessionCore(
     /** Consecutive failed direct-ring connect attempts; stretches the retry delay. Guarded by `monitor`. */
     internal var ringConnectFailures = 0
     internal val ringHealthRecords = ArrayList<RingProtocol.HealthRecord>()
+    internal var ringHealthIdentity: String? = null
     /**
      * Total records ever appended to [ringHealthRecords], including every
      * one already consumed or evicted. Never reset.
@@ -207,6 +215,23 @@ class GlassesSessionCore(
      * ACKs each DATA page immediately rather than after the whole run.
      */
     internal var ringHealthRspSeen = false
+    internal var ringHealthExpectedCommand = -1
+    internal var ringHealthExpectedSeq = -1
+    internal var ringHealthTransferActive = false
+    internal var ringHealthTransferFailed = false
+    internal var ringHealthTransferDeadlineMs = 0L
+    internal var ringHealthIntakeInFlight = 0
+    internal var ringPhoneAuthExpectedSeq = -1
+    internal var ringPhoneAuthAccepted = false
+    internal var ringHealthStartFreshRequested = false
+    internal var ringHealthStartFreshActive = false
+    internal var ringHealthStartFreshGeneration = 0L
+    internal var ringHealthStartFreshDeadlineMs = 0L
+    internal var ringHealthStartFreshState = "idle"
+    internal var lastRingHealthStartFreshResult = ""
+    internal var ringHealthStartFreshExpectedCommand = -1
+    internal var ringHealthStartFreshExpectedSeq = -1
+    internal var ringHealthStartFreshResponse: RingProtocol.Frame? = null
     /** Bumped once per decoded health DATA page (any type) so a waiter can
      * detect "a page just arrived" without polling ringHealthRecords. */
     internal var ringHealthPageCounter = 0
@@ -241,7 +266,13 @@ class GlassesSessionCore(
      * Guarded by `monitor`.
      */
     internal var ringHealthWindowActive = false
+    internal var ringHealthWindowIndependent = false
     internal var ringHealthWindowDeadlineMs = 0L
+    internal var independentRingHealthEnabled = false
+    internal var backgroundRingHealthActive = false
+    internal var backgroundRingHealthGeneration = 0L
+    internal var backgroundRingHealthDeadlineMs = 0L
+    internal var backgroundRingHealthPagesBefore = 0
     /** Outcome of the last health pull, for the Ring status page. Guarded by `monitor`. */
     internal var lastRingHealthPullResult = ""
     internal var lastRingHealthPullAtMs = 0L
@@ -297,7 +328,12 @@ class GlassesSessionCore(
     internal var lastFaceclawFramebufferLeaseQueuedAtMs = 0L
     internal var faceclawFramebufferControlGeneration = 0
     internal var faceclawFramebufferControlSentCount = 0
+    internal var headUpEnabled = true
+    internal var headUpSessionGeneration = 0L
+    internal var headUpOperationGeneration = 0L
+    internal var headUpOperationActive = false
     internal var faceclawWakePendingNonce = -1
+    internal var faceclawWakePendingHeadUp = false
     /**
      * The last firmware-info read said the glasses run Faceclaw's custom
      * firmware. Gates the private modes (cleanup, resource cache, ...) so stock
@@ -375,6 +411,12 @@ class GlassesSessionCore(
     // Which of the ring's two roles the direct link claims; see setDirectRingRole.
     internal var directRingRole = DIRECT_RING_ROLE_PHONE
     internal var ringRoleReconnectPending = false
+    internal var ringRoleChangeGeneration = 0L
+    internal var ringRoleChangeRequestActive = false
+    internal var ringRoleChangeDeadlineMs = 0L
+    internal var ringRoleChangeResult: Boolean? = null
+    internal var ringRoleChangeFrozen = false
+    internal var ringRoleChangeRequiresLegacyDisable = false
     // Glasses-role direct link: the per-connection setup (legacy pair-auth +
     // touch source on) still to be written, what the ring made of the
     // pair-auth, and the once-per-connection target clear after a rejection.
@@ -391,6 +433,19 @@ class GlassesSessionCore(
     internal var lastRingConfigCommand = ""
     internal var lastRingConfigCommandAtMs = 0L
     internal var lastRingConfigResult = ""
+    internal var ringBindingActive = false
+    internal var ringBindingGeneration = 0L
+    internal var ringBindingDeadlineMs = 0L
+    internal var ringBindingReservationDeadlineMs = 0L
+    internal var ringBindingResult: String? = null
+    internal var ringBindingRightWire = ByteArray(0)
+    internal var ringBindingLeftWire = ByteArray(0)
+    internal var ringBindingRingId = ""
+    internal var ringBindingRingName = ""
+    internal var ringBindingExpectedSeq = -1
+    internal var ringBindingExpectedCommand = -1
+    internal var ringBindingResponse: RingProtocol.Frame? = null
+    internal val ringBindingQueuedConnectMessages = ArrayList<OutboundMessage>()
     // Last direct-link notification nothing decoded (e.g. legacy-channel
     // frames while claiming the glasses role).
     internal var lastDirectRingRaw = ""
@@ -566,6 +621,18 @@ class GlassesSessionCore(
         requiredFirmwareRevision = revision
     }
 
+    fun setRingHealthIdentity(ringId: String) {
+        val normalized = normalizeRingHealthIdentity(ringId)
+            ?: throw IllegalArgumentException("Ring health identity must be a Bluetooth MAC")
+        monitor.withLock {
+            check(!running) { "Ring health identity must be set before start" }
+            check(ringHealthIdentity == null || ringHealthIdentity == normalized) {
+                "Ring health identity cannot be changed"
+            }
+            ringHealthIdentity = normalized
+        }
+    }
+
     /**
      * Drive a RayNeo iO instead of a G2: one BLE link (pass its address as both arms; no
      * ring), the iO handshake and page lease, and the Faceclaw display lists of the
@@ -599,19 +666,43 @@ class GlassesSessionCore(
     /** True when this session drives a RayNeo iO. */
     fun isRayNeoIo(): Boolean = isIo
 
-    /** Start the worker (through the host); false when it was already running. */
-    fun start(): Boolean {
+    /** Start only the existing ring worker; no arm connection is attempted. */
+    fun startHealthOnly(): Boolean {
         monitor.withLock {
-            if (running) {
-                return false
+            if (!running) {
+                running = true
+                userDisconnectRequested = false
+                reconnectHalted = false
+                incompatibleFirmware = null
+                shutdownRequested = false
             }
-            running = true
-            userDisconnectRequested = false
-            reconnectHalted = false
-            incompatibleFirmware = null
-            shutdownRequested = false
-            host.startWorker { run() }
-            if (hasRingAddress()) {
+            if (!hasRingAddress() || ringWorkerStarted) return false
+            ringWorkerStarted = true
+            val done = Latch(1, platform)
+            ringWorkerDone = done
+            host.startRingWorker {
+                try {
+                    runRingWorker()
+                } finally {
+                    done.countDown()
+                }
+            }
+            return true
+        }
+    }
+
+    /** Start the arm worker once, sharing the same core, ring worker and transport. */
+    fun promoteToInteractive(): Boolean {
+        monitor.withLock {
+            if (!running) {
+                running = true
+                userDisconnectRequested = false
+                reconnectHalted = false
+                incompatibleFirmware = null
+                shutdownRequested = false
+            }
+            if (hasRingAddress() && !ringWorkerStarted) {
+                ringWorkerStarted = true
                 val done = Latch(1, platform)
                 ringWorkerDone = done
                 host.startRingWorker {
@@ -622,9 +713,15 @@ class GlassesSessionCore(
                     }
                 }
             }
+            if (interactiveWorkerStarted) return false
+            interactiveWorkerStarted = true
+            host.startWorker { run() }
             return true
         }
     }
+
+    /** Existing callers start the full interactive session. */
+    fun start(): Boolean = promoteToInteractive()
 
     fun disconnect() {
         /* On the normal path DashboardController already sent mode 11 after
@@ -634,11 +731,28 @@ class GlassesSessionCore(
         if (!cfwCleanupDelivered && !sendCfwCleanup() && isG2) {
             releaseFaceclawFramebufferLease()
         }
+        finishBackgroundRingHealth("cancelled")
         monitor.withLock {
             ConnectionCounters.increment("g2.disconnect-requested")
             if (sessionReady) countSessionEnded("requested")
             userDisconnectRequested = true
             running = false
+            headUpSessionGeneration++
+            interactiveWorkerStarted = false
+            ringWorkerStarted = false
+            ringRoleChangeGeneration++
+            ringRoleChangeRequestActive = false
+            ringRoleChangeFrozen = false
+            ringRoleChangeResult = false
+            if (ringBindingActive) {
+                ringBindingGeneration++
+                ringBindingResult = "failed: session-closed"
+            }
+            ringBindingActive = false
+            ringConnectAttemptGeneration++
+            ringConnectAttemptActive = false
+            ringBackgroundConnectPending = false
+            rejectNextRingConnection = true
             audioCaptureActive = false
             audioPacketListener = null
             monitor.signalAll()
@@ -760,13 +874,90 @@ class GlassesSessionCore(
         interruptibleSleep.interrupt()
     }
 
+    /** Permit explicit read-only R1 retrieval while the glasses session is unavailable. */
+    fun setIndependentRingHealthEnabled(enabled: Boolean) {
+        val cancelPending = monitor.withLock {
+            independentRingHealthEnabled = enabled
+            if (enabled || sessionReady && !ringHealthWindowIndependent) return@withLock false
+            ringHealthPullRequested = false
+            ringHealthTransferFailed = ringHealthTransferActive
+            val cancel = ringConnectAttemptActive || ringBackgroundConnectPending ||
+                ringHealthWindowIndependent && ringConnected && !ringNotificationsReady
+            if (ringConnectAttemptActive || ringBackgroundConnectPending) {
+                ringConnectAttemptGeneration++
+                ringConnectAttemptActive = false
+                ringBackgroundConnectPending = false
+                rejectNextRingConnection = true
+            }
+            endRingHealthWindowLocked("independent health disabled")
+            monitor.signalAll()
+            cancel
+        }
+        if (cancelPending) link.disconnect(ringAddress)
+    }
+
+    /** Whether an explicit health request can be accepted now, not whether a measurement will succeed. */
+    fun canSyncRingHealth(): Boolean = monitor.withLock {
+        running && !userDisconnectRequested && hasRingAddress() &&
+            (sessionReady || independentRingHealthEnabled && host.supportsRingHealth() && host.ringHealthReadOnly())
+    }
+
+    fun requestBackgroundRingHealth(generation: Long, timeoutMs: Int): Boolean =
+        requestBackgroundRingHealthJob(generation, timeoutMs)
+
+    fun cancelBackgroundRingHealth(generation: Long): Boolean =
+        cancelBackgroundRingHealthJob(generation)
+
+    fun prepareForRingRoleChange(timeoutMs: Int): Boolean = prepareForRingRoleChangeOnWorker(timeoutMs)
+
+    fun bindRingToGlasses(
+        rightHardwareMac: String,
+        leftHardwareMac: String,
+        ringHardwareMac: String,
+        ringName: String,
+        timeoutMs: Int,
+    ): String = bindRingToGlassesOnWorker(
+        rightHardwareMac,
+        leftHardwareMac,
+        ringHardwareMac,
+        ringName,
+        timeoutMs,
+        reserveRingBindingOperation(timeoutMs),
+    )
+
+    internal fun reserveRingBindingOperation(timeoutMs: Int): Long = monitor.withLock {
+        if (ringBindingActive) return -1L
+        ringBindingGeneration++
+        ringBindingReservationDeadlineMs = now() + timeoutMs.coerceIn(1, 15_000)
+        ringBindingGeneration
+    }
+
+    fun cancelRingBinding(): Boolean = cancelRingBindingOperation("failed: cancelled")
+
+    /** Queue the one explicit operation that may enable recording and correct the R1 clock. */
+    fun requestRingHealthStartFresh(): Long {
+        val generation = monitor.withLock {
+            if (!host.supportsRingHealth()) throw IllegalStateException("R1 health is unavailable")
+            if (ringHealthStartFreshRequested || ringHealthStartFreshActive) return@withLock ringHealthStartFreshGeneration
+            ringHealthStartFreshGeneration++
+            ringHealthStartFreshRequested = true
+            ringHealthStartFreshDeadlineMs = now() + 60_000L
+            ringHealthStartFreshState = "queued"
+            lastRingHealthStartFreshResult = "waiting for the R1 phone-role window"
+            monitor.signalAll()
+            ringHealthStartFreshGeneration
+        }
+        interruptibleSleep.interrupt()
+        return generation
+    }
+
     /**
      * Snapshot of everything the ring has pushed and not yet been consumed,
      * with the watermark needed to hand it back as consumed.
      */
     fun takeRingHealthBatch(): RingHealthBatch {
         monitor.withLock {
-            return RingHealthBatch(ArrayList(ringHealthRecords), ringHealthTotalAdded)
+            return RingHealthBatch(ArrayList(ringHealthRecords), ringHealthTotalAdded, ringHealthIdentity)
         }
     }
 
@@ -865,11 +1056,44 @@ class GlassesSessionCore(
             )
             if (!enabled) {
                 faceclawWakePendingNonce = -1
+                faceclawWakePendingHeadUp = false
             }
         }
         interruptibleSleep.interrupt()
         return waitForFaceclawWakeControlDelivery(generation, FACECLAW_WAKE_CONTROL_WAIT_MS)
     }
+
+    fun setHeadUpEnabled(enabled: Boolean) {
+        val cancelledPendingHeadUp = monitor.withLock {
+            headUpEnabled = enabled
+            if (enabled || faceclawWakePendingNonce < 0 || !faceclawWakePendingHeadUp) {
+                return@withLock false
+            }
+            enqueueFaceclawWakeControlLocked(
+                BleProtocol.FACECLAW_WAKE_OP_READY,
+                faceclawWakePendingNonce,
+                true
+            )
+            faceclawWakePendingNonce = -1
+            faceclawWakePendingHeadUp = false
+            true
+        }
+        if (cancelledPendingHeadUp) interruptibleSleep.interrupt()
+    }
+
+    /** Read both temples' independently correlated full status; disagreement is unavailable. */
+    fun readHeadUpAngle(): Int = readHeadUpAngleExplicit()
+
+    /** Write both temples, then trust only independent full-status readback from both. */
+    fun setHeadUpAngle(angle: Int): Boolean = setHeadUpAngleExplicit(angle)
+
+    internal fun captureHeadUpSessionGeneration(): Long = monitor.withLock { headUpSessionGeneration }
+
+    internal fun readHeadUpAngleForSession(expectedSessionGeneration: Long): Int =
+        readHeadUpAngleExplicit(expectedSessionGeneration)
+
+    internal fun setHeadUpAngleForSession(angle: Int, expectedSessionGeneration: Long): Boolean =
+        setHeadUpAngleExplicit(angle, expectedSessionGeneration)
 
     /**
      * Wait until the recreated layout and retained compositor frame have both
@@ -894,6 +1118,7 @@ class GlassesSessionCore(
                             true
                         )
                         faceclawWakePendingNonce = -1
+                        faceclawWakePendingHeadUp = false
                     }
                     break
                 }
@@ -1092,6 +1317,13 @@ class GlassesSessionCore(
             status["ringAddress"] = ringAddress
             status["glassesConnected"] = rightConnected && leftConnected
             status["sessionReady"] = sessionReady
+            status["independentHealthEnabled"] = independentRingHealthEnabled
+            status["healthAdmissionMode"] = when {
+                sessionReady -> "glasses"
+                running && independentRingHealthEnabled && host.supportsRingHealth() && host.ringHealthReadOnly() ->
+                    "independent-read-only"
+                else -> "unavailable"
+            }
             status["directConnected"] = ringConnected
             status["directNotificationsReady"] = ringNotificationsReady
             status["directConnectCount"] = ringConnectCount
@@ -1118,6 +1350,9 @@ class GlassesSessionCore(
             status["lastHealthPull"] = lastRingHealthPullResult
             status["lastHealthPullAgeMs"] = age(lastRingHealthPullAtMs)
             status["heldHealthRecords"] = ringHealthRecords.size
+            status["freshStartGeneration"] = ringHealthStartFreshGeneration
+            status["freshStartState"] = ringHealthStartFreshState
+            status["freshStartResult"] = lastRingHealthStartFreshResult
             status["directGlassesAuth"] = directGlassesAuth
             status["directGlassesAuthAgeMs"] = age(directGlassesAuthAtMs)
             status["lastRingCommand"] = lastRingConfigCommand
@@ -1147,6 +1382,7 @@ class GlassesSessionCore(
      */
     fun setDirectRingRole(role: String?) {
         val normalized = if (role == DIRECT_RING_ROLE_GLASSES) DIRECT_RING_ROLE_GLASSES else DIRECT_RING_ROLE_PHONE
+        if (normalized != DIRECT_RING_ROLE_PHONE) cancelRingBindingOperation("failed: mode changed")
         monitor.withLock {
             if (normalized == directRingRole) return
             directRingRole = normalized
@@ -1902,6 +2138,7 @@ class GlassesSessionCore(
         var emitWearState = false
         var putOnWhileCharging = false
         var event: G2Event? = null
+        var glassesRingConnectionState: Pair<Boolean, String>? = null
         monitor.withLock {
             lastIncomingAtMs = now()
             if (decodedWearState >= 0 && decodedWearState != wearState) {
@@ -1914,7 +2151,7 @@ class GlassesSessionCore(
             }
             if (frame.ok
                     && (frame.sid == BleProtocol.SID_SECURITY_AUTH || frame.sid == BleProtocol.SID_RING_DATA)) {
-                recordGlassesRingReportLocked(frame, address)
+                glassesRingConnectionState = recordGlassesRingReportLocked(frame, address)
             }
             var faceclawWakeNotification = false
             if (shutdownRequested
@@ -1923,28 +2160,41 @@ class GlassesSessionCore(
                     && address.equals(rightAddress, ignoreCase = true)) {
                 val wakeNonce = BleProtocol.parseFaceclawWakeEvent(frame.pb)
                 if (wakeNonce >= 0) {
-                    faceclawWakePendingNonce = wakeNonce
-                    enqueueFaceclawWakeControlLocked(
-                        BleProtocol.FACECLAW_WAKE_OP_CLAIM,
-                        wakeNonce,
-                        true
-                    )
-                    faceclawWakeNotification = true
-                    lastConnectionOrInputAtMs = lastIncomingAtMs
-                    // The event type says which gesture woke the glasses: TS
-                    // gives a head-up the Glanceboard and a double tap the
-                    // regular UI. The claim handshake is the same for both.
                     val headUp = BleProtocol.parseFaceclawWakeEventCode(frame.pb) ==
                         BleProtocol.FACECLAW_WAKE_EVENT_HEAD_UP
-                    event = G2Event(
-                        "display-wake",
-                        "",
-                        if (headUp) BleProtocol.EVENT_HEAD_UP else BleProtocol.EVENT_DOUBLE_CLICK,
-                        0,
-                        0
-                    )
-                    logLine("claimed deferred dashboard wake nonce=" + wakeNonce
-                        + (if (headUp) " (head-up)" else ""))
+                    faceclawWakeNotification = true
+                    if (headUp && !headUpEnabled) {
+                        faceclawWakePendingNonce = -1
+                        faceclawWakePendingHeadUp = false
+                        // Matching READY cancels the fallback; RELEASE would start the stock UI.
+                        enqueueFaceclawWakeControlLocked(
+                            BleProtocol.FACECLAW_WAKE_OP_READY,
+                            wakeNonce,
+                            true
+                        )
+                        logLine("ignored disabled deferred head-up wake nonce=" + wakeNonce)
+                    } else {
+                        faceclawWakePendingNonce = wakeNonce
+                        faceclawWakePendingHeadUp = headUp
+                        enqueueFaceclawWakeControlLocked(
+                            BleProtocol.FACECLAW_WAKE_OP_CLAIM,
+                            wakeNonce,
+                            true
+                        )
+                        lastConnectionOrInputAtMs = lastIncomingAtMs
+                        // The event type says which gesture woke the glasses: TS
+                        // gives a head-up the Glanceboard and a double tap the
+                        // regular UI. The claim handshake is the same for both.
+                        event = G2Event(
+                            "display-wake",
+                            "",
+                            if (headUp) BleProtocol.EVENT_HEAD_UP else BleProtocol.EVENT_DOUBLE_CLICK,
+                            0,
+                            0
+                        )
+                        logLine("claimed deferred dashboard wake nonce=" + wakeNonce
+                            + (if (headUp) " (head-up)" else ""))
+                    }
                 }
             }
             if (!faceclawWakeNotification
@@ -2119,6 +2369,7 @@ class GlassesSessionCore(
             }
         }
         interruptibleSleep.interrupt()
+        glassesRingConnectionState?.let { emitGlassesRingConnectionState(it.first, it.second) }
         if (emitWearState) {
             logLine(if (decodedWearState > 0) "wear state ON_HEAD" else "wear state OFF_HEAD")
             emitWearState(decodedWearState > 0)
@@ -2237,7 +2488,14 @@ class GlassesSessionCore(
             return
         }
         if (isConfiguredRingAddress(address)) {
+            if (!connected) cancelRingBindingOperation("failed: ring disconnected")
+            var rejectConnection = false
             monitor.withLock {
+                if (connected && (userDisconnectRequested || rejectNextRingConnection)) {
+                    rejectConnection = true
+                }
+                if (connected) ringBackgroundConnectPending = false
+                if (!connected) rejectNextRingConnection = false
                 if (connected != ringConnected) ringConnectedChangedAtMs = now()
                 if (connected && !ringConnected) ringConnectCount++
                 ringConnected = connected
@@ -2261,8 +2519,10 @@ class GlassesSessionCore(
             }
             ConnectionCounters.increment(if (connected) "ring.direct.connect" else "ring.direct.disconnect")
             logLine(if (connected) "direct ring BLE connected" else "direct ring BLE disconnected")
+            if (rejectConnection) link.disconnect(ringAddress)
             return
         }
+        if (!connected) cancelRingBindingOperation("failed: glasses disconnected")
         var lostSession = false
         monitor.withLock {
             if (address.equals(rightAddress, ignoreCase = true)) {
@@ -2289,6 +2549,7 @@ class GlassesSessionCore(
                     countSessionEnded("arm-drop")
                 }
                 sessionReady = false
+                headUpSessionGeneration++
                 fixedLayoutCreated = false
                 startupProbePending = false
                 chargingMode = false
@@ -2341,6 +2602,7 @@ class GlassesSessionCore(
 
             monitor.withLock {
                 sessionReady = true
+                headUpSessionGeneration++
                 // A fresh transport prelude always starts an active EvenHub
                 // lifecycle, even if the previous connection dropped while
                 // its page was intentionally suspended.
@@ -2361,6 +2623,7 @@ class GlassesSessionCore(
                 lastAudioControlAckMagic = 0
                 audioCaptureActive = false
                 faceclawWakePendingNonce = -1
+                faceclawWakePendingHeadUp = false
                 cfwCleanupDelivered = false
                 for (transport in cfwTransports) transport.reset()
                 lastCfwCleanupAckMagic = 0
@@ -2476,16 +2739,35 @@ class GlassesSessionCore(
         }
         val now = now()
         monitor.withLock {
-            return running
-                && sessionReady
+            return !ringRoleChangeRequestActive && !ringRoleChangeFrozen && ringConnectAdmittedLocked()
                 && !ringNotificationsReady
                 && now >= ringReconnectAfterMs
         }
     }
 
+    private fun ringConnectAdmittedLocked(): Boolean {
+        if (!running || userDisconnectRequested) return false
+        if (sessionReady) return true
+        return independentRingHealthEnabled && host.supportsRingHealth() && host.ringHealthReadOnly() &&
+            (ringHealthWindowActive || directRingRole == DIRECT_RING_ROLE_PHONE && ringHealthPullRequested)
+    }
+
+    private fun ringConnectAttemptCurrent(generation: Long): Boolean = monitor.withLock {
+        generation == ringConnectAttemptGeneration && ringConnectAdmittedLocked()
+    }
+
     internal fun tryConnectRing(reason: String) {
         if (!hasRingAddress()) {
             return
+        }
+        val owningBackgroundGeneration = monitor.withLock {
+            backgroundRingHealthGeneration.takeIf { backgroundRingHealthActive }
+        }
+        val generation = monitor.withLock {
+            ringConnectAttemptGeneration++
+            ringConnectAttemptActive = true
+            rejectNextRingConnection = false
+            ringConnectAttemptGeneration
         }
         try {
             // The ring is often out of range or bound to the glasses. Rather than block the
@@ -2494,13 +2776,21 @@ class GlassesSessionCore(
             // finish setup. The periodic recheck re-arms it if the attempt died without a
             // callback.
             if (!link.isConnected(ringAddress) && link.beginConnect(ringAddress, true)) {
-                monitor.withLock {
-                    ringReconnectAfterMs = now() + ConnectionOptions.RING_RECONNECT_DELAY_MS
+                val accepted = monitor.withLock {
+                    if (generation != ringConnectAttemptGeneration || !ringConnectAdmittedLocked()) false else {
+                        ringConnectAttemptActive = false
+                        ringBackgroundConnectPending = true
+                        ringReconnectAfterMs = now() + ConnectionOptions.RING_RECONNECT_DELAY_MS
+                        true
+                    }
                 }
+                if (!accepted) link.disconnect(ringAddress)
                 return
             }
-            connectRing()
+            if (!ringConnectAttemptCurrent(generation)) return
+            connectRing(generation)
         } catch (t: Throwable) {
+            if (monitor.withLock { generation != ringConnectAttemptGeneration }) return
             // Back off exponentially: each attempt's setup steps hold the
             // GATT pipeline the glasses share, and an unreachable ring (e.g.
             // held by the glasses) fails the same way every time.
@@ -2510,8 +2800,14 @@ class GlassesSessionCore(
                 ringConnectFailures++
                 ringConnected = false
                 ringNotificationsReady = false
+                ringBackgroundConnectPending = false
                 ringReconnectAfterMs = now() + delay
                 lastDirectRingError = "connect failed: " + safeMessage(t)
+                if (host.ringHealthReadOnly() && ringHealthWindowActive) {
+                    lastRingHealthPullResult = "aborted: PHONE role setup failed"
+                    lastRingHealthPullAtMs = now()
+                    endRingHealthWindowLocked("PHONE role setup failed")
+                }
                 delay
             }
             logLine("direct ring connect failed (" + reason + "): " + safeMessage(t)
@@ -2519,18 +2815,27 @@ class GlassesSessionCore(
             // Start the next attempt from a fresh connection rather than retrying setup on
             // one that just failed it.
             link.disconnect(ringAddress)
+            finishBackgroundRingHealth("aborted", owningBackgroundGeneration)
+        } finally {
+            monitor.withLock {
+                if (generation == ringConnectAttemptGeneration) ringConnectAttemptActive = false
+            }
         }
     }
 
-    internal fun connectRing() {
+    internal fun connectRing(generation: Long = monitor.withLock { ringConnectAttemptGeneration }) {
         logLine("connecting direct ring $ringAddress")
         // autoConnect=true (see SessionLink.connect's 3-arg overload) -
         // matches what Even's own app does for this device specifically.
         // Direct connect (false, the default used for the glasses) was
         // measured dying ~5s into an otherwise-idle ring connection,
         // repeatedly, with nothing else competing for it.
-        if (!link.connect(ringAddress, ConnectionOptions.RING_CONNECT_TIMEOUT_MS, true)) {
+        if (!link.connect(ringAddress, ringOperationTimeoutMs(ConnectionOptions.RING_CONNECT_TIMEOUT_MS), true)) {
             throw IllegalStateException("connect failed: $ringAddress")
+        }
+        if (!ringConnectAttemptCurrent(generation)) {
+            link.disconnect(ringAddress)
+            return
         }
 
         // Deliberately NOT requesting CONNECTION_PRIORITY_HIGH here (2026-09-11).
@@ -2546,10 +2851,18 @@ class GlassesSessionCore(
         // while Even's default (longer) one wouldn't - untested but the timing
         // match is exact, not approximate. Leaving default priority for the
         // ring only; the glasses' own HIGH-priority request is untouched.
-        link.requestMtu(ringAddress, ConnectionOptions.RING_DESIRED_MTU, ConnectionOptions.CONNECT_TIMEOUT_MS)
+        link.requestMtu(ringAddress, ConnectionOptions.RING_DESIRED_MTU, ringOperationTimeoutMs(ConnectionOptions.CONNECT_TIMEOUT_MS))
+        if (!ringConnectAttemptCurrent(generation)) {
+            link.disconnect(ringAddress)
+            return
+        }
 
-        if (!link.discoverServices(ringAddress, ConnectionOptions.SERVICES_TIMEOUT_MS)) {
+        if (!link.discoverServices(ringAddress, ringOperationTimeoutMs(ConnectionOptions.SERVICES_TIMEOUT_MS))) {
             throw IllegalStateException("discoverServices failed: $ringAddress")
+        }
+        if (!ringConnectAttemptCurrent(generation)) {
+            link.disconnect(ringAddress)
+            return
         }
 
         // Even's app subscribes only to the health-data notify CCCD (ATT
@@ -2570,19 +2883,34 @@ class GlassesSessionCore(
         // role setting decides which CCCDs we enable; see setDirectRingRole.
         val configuredRole: String
         val role = monitor.withLock {
+            if (generation != ringConnectAttemptGeneration || !ringConnectAdmittedLocked()) return
             configuredRole = directRingRole
             effectiveRingRoleLocked()
         }
+        if (host.ringHealthReadOnly() && role == DIRECT_RING_ROLE_PHONE
+            && !enableRingNotification(BleProtocol.R1_LEGACY_NOTIFY_CHAR_UUID, false)) {
+            throw IllegalStateException("could not disable legacy R1 notifications for PHONE role")
+        }
         val legacyNotify = role == DIRECT_RING_ROLE_GLASSES
             && enableRingNotification(BleProtocol.R1_LEGACY_NOTIFY_CHAR_UUID)
+        if (!ringConnectAttemptCurrent(generation)) {
+            link.disconnect(ringAddress)
+            return
+        }
         val dataNotify = enableRingNotification(BleProtocol.R1_NOTIFY_CHAR_UUID)
+        if (!ringConnectAttemptCurrent(generation)) {
+            link.disconnect(ringAddress)
+            return
+        }
         if (!legacyNotify && !dataNotify) {
             throw IllegalStateException("no R1 notify characteristic subscribed")
         }
 
         monitor.withLock {
+            if (generation != ringConnectAttemptGeneration || !ringConnectAdmittedLocked()) return
             ringConnected = true
             ringNotificationsReady = true
+            ringBackgroundConnectPending = false
             ringReconnectAfterMs = 0
             // The ring's sequence counter restarts with the connection.
             ringSeq = 0
@@ -2601,6 +2929,7 @@ class GlassesSessionCore(
         }
         logLine("direct ring ready role=$role legacyNotify=$legacyNotify dataNotify=$dataNotify"
             + (if (role != configuredRole) " (health window; configured role $configuredRole)" else ""))
+        if (role == DIRECT_RING_ROLE_PHONE && configuredRole == DIRECT_RING_ROLE_PHONE) emitPhoneRingReady()
 
         // The glasses role means no pairAuth (it would ask for the phone role
         // on the same link) and therefore no health sync. Direct mode gets its
@@ -2611,13 +2940,13 @@ class GlassesSessionCore(
         }
     }
 
-    internal fun enableRingNotification(characteristicUuid: String): Boolean {
+    internal fun enableRingNotification(characteristicUuid: String, enable: Boolean = true): Boolean {
         try {
             return link.enableNotifications(
                 ringAddress,
                 characteristicUuid,
-                true,
-                ConnectionOptions.DESCRIPTOR_TIMEOUT_MS
+                enable,
+                ringOperationTimeoutMs(ConnectionOptions.DESCRIPTOR_TIMEOUT_MS)
             )
         } catch (t: Throwable) {
             logDebug("direct ring notify subscribe skipped: " + characteristicUuid + " " + safeMessage(t))

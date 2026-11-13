@@ -4,6 +4,7 @@ import type {
   LlmStreamOptions,
 } from "../assistant/llm-protocol";
 import { openSseRequest, type SseListener } from "./sse";
+import { traceAssistantStage } from "./assistant-trace";
 
 /** True only for Venice's official API root, never for lookalike hosts. */
 export function isVeniceApiBaseUrl(input: string): boolean {
@@ -16,6 +17,11 @@ export type OpenAiCompatibleStreamOptions = LlmStreamOptions & {
   baseUrl: string;
   /** Venice-only web search; never sent to other compatible providers. */
   webSearch?: boolean;
+  /** Stable caller identity for one Faceclaw conversation. */
+  user?: string;
+  /** Server-issued ID of a paired, currently connected OpenClaw answer surface. */
+  inputConnectionId?: string;
+  onOpenClawRun?: (runId: string, sessionKey: string, inputConnectionId: string) => void;
 };
 
 type PendingToolCall = {
@@ -38,6 +44,7 @@ export function streamOpenAiCompatibleChat(options: OpenAiCompatibleStreamOption
   let settled = false;
   let text = "";
   let finishReason: string | null = null;
+  let boundRunId = "";
   const toolCalls = new Map<number, PendingToolCall>();
   const providerMetadata: Record<string, any> = {};
   const reasoningDetails = new ReasoningDetailsAccumulator();
@@ -115,6 +122,7 @@ export function streamOpenAiCompatibleChat(options: OpenAiCompatibleStreamOption
     messages: buildChatMessages(options),
     stream: true,
   };
+  if (options.user?.trim()) body.user = options.user.trim();
   // Let the provider choose its default unless a one-shot feature supplies a cap.
   if (options.maxTokens !== undefined) body.max_tokens = options.maxTokens;
   if (options.tools?.length) {
@@ -137,6 +145,7 @@ export function streamOpenAiCompatibleChat(options: OpenAiCompatibleStreamOption
 
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+  if (options.inputConnectionId) headers["X-OpenClaw-Input-Connection"] = options.inputConnectionId;
 
   const listener: SseListener = {
     onLine: (line: string) => {
@@ -157,6 +166,23 @@ export function streamOpenAiCompatibleChat(options: OpenAiCompatibleStreamOption
       if (event?.error) {
         fail(`OpenAI-compatible: ${String(event.error.message ?? event.error)}`);
         return;
+      }
+      if (options.inputConnectionId) {
+        if (!boundRunId) {
+          traceAssistantStage("sse.binding-seen");
+          if (typeof event.id !== "string" || !event.id || typeof event.openclaw?.sessionKey !== "string" || !event.openclaw.sessionKey ||
+              event.openclaw?.inputConnectionId !== options.inputConnectionId) {
+            fail("OpenClaw did not verify the confirmation binding; the request was cancelled");
+            return;
+          }
+          boundRunId = event.id;
+          try { options.onOpenClawRun?.(boundRunId, event.openclaw.sessionKey, event.openclaw.inputConnectionId); }
+          catch (error) { fail(String((error as Error).message)); return; }
+          traceAssistantStage("sse.bound");
+        } else if (event.id !== boundRunId) {
+          fail("OpenClaw response binding changed; the request was cancelled");
+          return;
+        }
       }
       const choice = event?.choices?.[0];
       if (!choice) return; // Usage and provider-metadata chunks may have no choices.
@@ -310,15 +336,19 @@ function buildChatMessages(options: OpenAiCompatibleStreamOptions): any[] {
 
 function describeHttpError(code: number, body: string): string {
   let detail = "";
+  let errorType = "";
   try {
     const parsed = JSON.parse(body);
     detail = String(parsed?.error?.message ?? parsed?.error ?? parsed?.message ?? "");
+    errorType = String(parsed?.error?.type ?? "");
   } catch {
     // Non-JSON error body.
   }
   switch (code) {
     case 401: return "OpenAI-compatible: invalid API key";
-    case 403: return "OpenAI-compatible: API key lacks permission";
+    case 403: return errorType === "permission_error" && detail
+      ? `OpenAI-compatible: ${detail}`
+      : "OpenAI-compatible: API key lacks permission";
     case 429: return "OpenAI-compatible: rate limited, try again shortly";
     case 500:
     case 502:

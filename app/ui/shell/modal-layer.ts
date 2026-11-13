@@ -1,4 +1,7 @@
 import { GrayImage } from "../../graphics/image";
+import { DrawExpression as E } from "../../graphics/draw-expression";
+import { DrawOp } from "../../graphics/display-list";
+import type { NotificationPopupPresentation } from "./notification-popup-timeout";
 import { flattenPlanes } from "../../graphics/plane";
 import { InputEvent } from "../gestures";
 import { Layer, LayerActions, LayerContext, LayerStack, PaintBelow } from "../layers";
@@ -48,6 +51,8 @@ export class ShellModalLayer implements Layer {
       removed?: () => void;
       /** Input reached the modal (before its inner stack handles it). */
       input?: (event: InputEvent) => void;
+      /** Notification-only opt-in; null uses the ordinary host-timed surface. */
+      expiration?: () => NotificationPopupPresentation | null;
     } = {},
   ) {
     this.stack = new LayerStack(baseLayer, actions, modalInterior());
@@ -78,6 +83,20 @@ export class ShellModalLayer implements Layer {
     image.drawRect(rect.x, rect.y, rect.width, rect.height, 110);
     image.bitBlt(inner, innerX, innerY, { transparentZero: true });
     top.image.copyPresentationsInto(image, innerX + top.x, innerY + top.y);
+    const expiration = this.hooks.expiration?.();
+    if (expiration) {
+      // One bounded resource includes the whole popup. Settle its selection
+      // animation so the selected action is immediately clear after input.
+      const baked = image.withDrawsBaked(true, Date.now() + 3_600_000);
+      const resource = new GrayImage(rect.width, rect.height);
+      resource.bitBlt(baked, -rect.x, -rect.y);
+      const retained = new GrayImage(image.width, image.height);
+      retained.drawDisplayList({ resources: [resource], timeline: expiration, calls: [{
+        op: DrawOp.RECT_COPY, resource: 0, x: 0, y: 0, width: rect.width, height: rect.height,
+        dx: E.progress(1, expiration.durationMs - 1).toInt().mul(E.i32(1024)), dy: 0,
+      }] }, rect.x, rect.y, rect.width, rect.height);
+      return retained;
+    }
     return image;
   }
 

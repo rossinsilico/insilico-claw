@@ -78,20 +78,29 @@ export class GlanceHost {
     return this.options.getProvider()?.isEnabled() ?? false;
   }
 
+  /** Head-up Off suppresses activation even when the board itself is disabled. */
+  allowsHeadTilt(): boolean {
+    return this.options.getProvider()?.showOnHeadTilt() ?? true;
+  }
+
   /**
    * The glance event a sleep-time gesture means under the board's settings,
    * or null when the shell should see the input as usual: nothing while the
    * board is disabled, no press from a tap when "Show on tap" is disabled,
    * no hold when "Show on long press" is off, no press from a head-tilt when
-   * "Show on head tilt" is off (it then wakes the regular UI). A release
+   * "Head-up activation" is off (the controller drops that wake). A release
    * always passes so a hold in progress can end.
    */
   eventForGesture(gesture: "head-tilt" | (string & {})): GlanceEvent | null {
     const provider = this.options.getProvider();
-    if (!provider?.isEnabled()) return null;
+    if (!provider) return null;
+    if (gesture === "head-tilt") {
+      if (!provider.showOnHeadTilt() || provider.headUpTarget() !== "glanceboard") return null;
+      return glanceEventForGesture(gesture, this.isVisible());
+    }
+    if (!provider.isEnabled()) return null;
     if (gesture === "click" && !provider.showOnTap()) return null;
     if ((gesture === "long-press" || gesture === "short-then-long-press") && !provider.showOnLongPress()) return null;
-    if (gesture === "head-tilt" && !provider.showOnHeadTilt()) return null;
     return glanceEventForGesture(gesture, this.isVisible());
   }
 

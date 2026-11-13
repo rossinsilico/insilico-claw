@@ -3,10 +3,10 @@ import { GESTURE_DOUBLE_CLICK, type InputEvent } from "../gestures";
 import { Layer, type LayerActions, type LayerContext } from "../layers";
 import { createInputDialogMenu, paintInputDialog, type InputDialogRow } from "./input-dialog";
 
-const FOLLOW_UP_ROW = 1;
+const FOLLOW_UP_ROW = 0;
 const MENU_ROWS: readonly InputDialogRow[] = [
-  { label: "Done", dim: false },
   { label: "Follow-up", dim: false },
+  { label: "Done", dim: false },
 ];
 
 /** thinking: turn running; done/error: finished, showing the Done/Follow-up menu. */

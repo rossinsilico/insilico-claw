@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <title>Pilot app icon</title>
+  <rect width="1024" height="1024" fill="#214D3E"/>
+  <g fill="none" stroke="#F5F4EC" stroke-width="36" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="185" y="426" width="264" height="190" rx="62"/>
+    <rect x="575" y="426" width="264" height="190" rx="62"/>
+    <path d="M449 477 Q512 439 575 477 M133 429 L185 460 M839 460 L891 429"/>
+  </g>
+  <path d="M737 224 L752 271 L799 286 L752 301 L737 348 L722 301 L675 286 L722 271Z" fill="#D1E1B9"/>
+</svg>

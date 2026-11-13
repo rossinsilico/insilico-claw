@@ -761,6 +761,23 @@ export class FaceclawCommunicatorBridge {
     );
   }
 
+  async setHeadUpEnabled(enabled: boolean): Promise<void> {
+    await this.enqueueJavaCall(() => this.communicator.setHeadUpEnabled(enabled));
+  }
+
+  async readHeadUpAngle(stillCurrent: () => boolean = () => true): Promise<number> {
+    return this.enqueueJavaCall(() => {
+      if (!stillCurrent()) return -1;
+      const value = this.communicator.readHeadUpAngle();
+      return typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 60 ? value : -1;
+    });
+  }
+
+  async setHeadUpAngle(angle: number, stillCurrent: () => boolean = () => true): Promise<boolean> {
+    if (!Number.isInteger(angle) || angle < 0 || angle > 60) return false;
+    return this.enqueueJavaCall(() => stillCurrent() && Boolean(this.communicator.setHeadUpAngle(angle)));
+  }
+
   /**
    * Whether the glasses' own wake word reaches Faceclaw: on a RayNeo iO, its
    * "Hey RayNeo" switch (G2 glasses use the wake lease above instead).
