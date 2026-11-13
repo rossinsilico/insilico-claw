@@ -53,6 +53,20 @@ build_paths.sh
 **/xcuserdata/
 .private-backups/
 
+# Local runtime secrets and signing material
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.p12
+*.pfx
+*.p8
+*.pem
+*.key
+*.mobileprovision
+*.keystore
+*.jks
+
 # Kotlin build outputs and staged NativeScript artifacts
 native/kotlin/.gradle/
 native/kotlin/.kotlin/
